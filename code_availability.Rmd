@@ -1,0 +1,1706 @@
+---
+title: Combining spatial transcriptomics and ECM imaging in 3D for mapping cellular
+  interactions in the tumor microenvironment
+output:
+  html_document:
+    df_print: paged
+---
+
+# Preparation 
+
+## Import packages
+```{r include=FALSE}
+# Generally required
+library(Seurat) #v5.1.0
+
+library(dplyr) #v1.1.4
+library(tidyr) #v1.3.1
+library(ggplot2) #v3.5.1
+library(pheatmap) #v1.0.12
+library(RColorBrewer) # v1.1-3
+library(data.table) #v1.16.2
+
+# Required only for specific figures
+library(magick) # v2.8.5 Supplementary figure 1.b
+library(plotly) # v4.10.4 Figure 2.a, 2.b and 3.a
+library(phyloseq) # Figure 3.b
+library(ggalluvial) # v0.12.5 Figure 3.d
+library(wrMisc) # Figure 4.b
+library(tiff) # v4.4.1 Figure 5.a 
+library(MatrisomeAnalyzeR) # Supplementary figure 5.f
+
+ # Optional, results can be imported
+library(SingleCellExperiment) #v1.26.0
+library(slingshot) # v2.12.0
+library(Giotto)
+library(CellChat) #v2.1.2
+```
+
+## Load color palettes
+```{r}
+celltype_palette= c("Tumor cells"= '#008744',"Respiratory epithelium"='#52d053',"Basal epithelial cells"='#a8e6cf',"Alveolar cells"='#dcedc1',"Fibroblasts"='#fb9062',"Vascular endothelium"='#ffc425',"Lymphatic endothelial cells"='#ffa31a',"Pericytes"='#ffd3b6',"Smooth muscle cells"='#8b6914', "Macrophages"='#00aedb',"Monocytes"='#90d2d8',"Dendritic cells"='#2D597A',"Mast cells"='#b4c8ea',"Cytotoxic T cells"='#8f0034',"Regulatory T cells"='#de598c',"B cells"='#b8a7ea',"Plasma cells"='#7D5AA5',"Cycling immune cells"='#ffdef2')
+
+niche_palette= c('Tumor core'= '#FFC20A', 'Tumor surface'= '#d62728', 'Airways'= '#ff7f0e', 'Alveoli'='#00A6A6', 'T cell niches'='#1f77b4', 'Macrophage niches'= '#e377c2', 'Dendritic cell niches'= 'purple', 'Desmoplastic stroma'='#279e68', 'Vascular stroma'=	'#340068','Smooth muscle'='#8c564b','Macrophage-rich stroma'= 'darkgreen')
+
+divergent_palette= rev(colorRampPalette(brewer.pal(n=5, 'RdBu'))(100))
+
+ECM_palette= c('1'='#f400e3', '2'= 'orange', '3'='#43ff44')
+
+fibro_palette= c('1'= '#985D98', '2'='#FABC2A','3'= '#E5B181', '4'= '#5AAA95', '5'= '#6AF1F1','6'="#e76f51")
+```
+
+## Import data
+
+## RECOMMENDED: Import processed Seurat objects (downloaded from Zenodo, please edit PATH)
+```{r}
+path_to_zenodo_folder= '../Zenodo/'
+
+cosmx= readRDS(paste0(path_to_zenodo_folder, 'preprocessed_objects/cosmx.rds'))
+fibroblasts= readRDS(paste0(path_to_zenodo_folder, 'preprocessed_objects/fibroblasts.rds'))
+tumor= readRDS(paste0(path_to_zenodo_folder, 'preprocessed_objects/tumor.rds'))
+```
+
+## SKIP: Import raw CosMx data (can be downloaded from Zenodo, please adjust path accordingly)
+```{r eval=FALSE, include=FALSE}
+section_list= list()
+
+# Loop through the sections profiled with CosMx SMI
+for (sect in c('04', '10', '16', '22', '28', '34')){
+
+# Import count matrix for one section
+  exprMat = read.csv(file = paste0(path_to_zenodo_folder, 'cosmx_flat_files/section_', sect, '/section_', sect, '_exprMat_file.csv')) #Please unzip section files first
+  exprMat_names= paste0('section_', sect, '_fov_', exprMat$fov, '_ID_', exprMat$cell_ID)
+
+# Remove negative probes and cell identifiers
+  neg_probes= grep(colnames(exprMat), 'NegPrb')
+  exprMat= exprMat[, ! colnames(exprMat) %in%  c("fov", "cell_ID", neg_probes)] 
+  rownames(exprMat)= exprMat_names
+
+# Import cell metadata
+  metadata = read.csv(paste0(path_to_zenodo_folder, 'cosmx_flat_files/section_', sect, '/section_', sect, '_metadata_file.csv')) # Import cell metadata
+  metadata_names = paste0('section_', sect, '_fov_',  metadata$fov, '_ID_', metadata$cell_ID)
+  rownames(metadata)= metadata_names
+  metadata$barcodes= metadata_names  
+
+# Create section Seurat object, filter cells with less than 10 detected genes
+  shared_names= intersect(metadata_names, exprMat_names)
+  section= CreateSeuratObject(counts = t(exprMat[shared_names, ]), meta.data = metadata[shared_names,], min.cells = 1, min.features = 10, 
+                            project = paste0('section_', sect), assay = 'Spatial')
+  
+# Add cell coordinates
+  coordinates= metadata[colnames(section), c('CenterX_global_px', 'CenterY_global_px')]
+  section[[paste0('section_', sect)]] <- new( 
+    Class = 'SlideSeq',
+    assay = "Spatial",
+    coordinates = coordinates)
+
+# Add section Seurat to list  
+  section_list[[paste0('section_', sect)]] = section
+
+}
+
+# Create merged seurat object
+cosmx= merge(section_list[1], section_list[-1]  )
+
+# Add 2D pixel coordinates to metadata 
+coordinates_2D_px = rbind(cosmx@images$section_4@coordinates, cosmx@images$section_10@coordinates, cosmx@images$section_16@coordinates,cosmx@images$section_22@coordinates, cosmx@images$section_28@coordinates, cosmx@images$section_34@coordinates)
+
+cosmx$x_2D_px= coordinates_2D_px$CenterX_global_px
+cosmx$y_2D_px= coordinates_2D_px$CenterY_global_px
+
+# Convert pixels to micron coordinates
+pixel_scale = 5.6 # 5.6 pixels for 1 micron
+
+cosmx$x_2D_mn= cosmx$x_2D_px/pixel_scale
+cosmx$y_2D_mn= cosmx$y_2D_px/pixel_scale
+
+
+# Clean environment
+remove(exprMat, metadata, exprMat_names, metadata_names, shared_names, section, coordinates, section_list, intersection_gap, coordinates_2D_px)
+
+# Normalize gene expression, perform dimensionality reduction and clustering
+cosmx = cosmx %>% SCTransform( assay = 'Spatial', new.assay.name = 'SCT', do.correct.umi = T, do.center = T, do.scale = T, verbose= F) %>% RunPCA( verbose = FALSE) %>% RunUMAP( dims = 1:30, verbose = FALSE) %>% FindNeighbors( dims = 1:30, verbose = FALSE) %>% FindClusters(verbose = FALSE)
+```
+
+# Figure 1 and Supplementary Figure 1
+
+## Supplementary Fig 1.b: Import and plot PanCK for one FOV (#7) in Section 4
+```{r eval=FALSE, include=FALSE}
+# Import PanCK IF image
+panck = image_read(paste0(path_to_zenodo_folder, 'cosmx_flat_files/section_4/Run1129_Section_04/CellComposite/CellComposite_F007.jpg'))
+panck_plot= image_ggplot(panck, interpolate = FALSE)
+
+# Import KRT19 transcripts coordinates and segmented DAPI images in the same FOV
+KRT19_mRNA= read.table(paste0(path_to_zenodo_folder,'cosmx_flat_files/section_4/section_4_tx_file.csv'), sep = ',', header = T)
+KRT19_mRNA= KRT19_mRNA[KRT19_mRNA$fov==7 & KRT19_mRNA$target == 'KRT19',  ]
+
+dapi_masks = image_read(path_to_zenodo_folder, 'cosmx_flat_files/section_4/Run1129_Section_04/CellOverlay/CellOverlay_F007.jpg')
+
+# Plot transcripts on DAPI masks
+transcript_plot= image_ggplot(dapi_masks, interpolate = FALSE) +  geom_point(inherit.aes = F, data=KRT19_mRNA,  col='#45F72F', size=0.000001, mapping = aes(x= x_local_px, y=y_local_px ))
+
+panck_plot+ transcript_plot
+
+# Clean environment
+remove(panck, panck_plot, KRT19_mRNA, dapi_masks, transcript_plot)
+```
+
+## Quantification of number of cells, transcripts and genes per cell
+```{r}
+ncol(cosmx)
+summary(cosmx$nCount_Spatial)
+summary(cosmx$nFeature_Spatial)
+```
+
+## Supplementary Fig 1.d: Section-to-section pseudobulk correlation
+```{r}
+# Sum transcript counts in each section to compute psedo-bulk gene expression profiles
+pseudobulk= t(rowsum(x = t(as.matrix(cosmx@assays$Spatial@counts)), group = cosmx$section)) 
+
+# Compute section-to-section correlations
+correlations = cor(pseudobulk, pseudobulk, method = 'spearman')
+range(correlations)
+
+# Plot hierarchically clustered heatmap
+pheatmap(correlations, display_numbers = T, number_color = 'black', color = c('#ffffcc','#fbec5d', '#ffbf00', '#ec5800','#e62020') )
+
+# Clean environment
+remove(pseudobulk, correlations)
+```
+
+## Supplementary Fig 1.e: Transcriptomic clusters
+```{r}
+# UMAP plot of segmented cells colored by transcriptomic clusters
+DimPlot(cosmx, group.by = 'SCT_snn_res.0.8', raster = T, label=T)+ ggtitle('')+ NoAxes() + NoLegend() + coord_fixed()
+```
+
+## Supplementary Fig 1.f: Dotplot of celltype expression of marker genes
+```{r}
+DefaultAssay(cosmx)= 'SCT'
+# Set cluster order before plotting
+cosmx$SCT_snn_res.0.8 = factor(as.character(cosmx$SCT_snn_res.0.8 ), levels = c(4, 5, 20, 22, 23, 6, 15, 18, 0, 1, 8, 17, 11, 12, 2, 7, 9, 16, 19, 3, 13, 21, 10, 14))
+Idents(cosmx) <- 'SCT_snn_res.0.8'
+
+# Define canonical markers
+marker_genes = c('EPCAM','S100A10', #Tumor cells
+                 'SCGB3A1', #Respiratory epithelium
+                 'KRT5', #Basal epithelial cells
+                 'FGG', #Alveolar cells
+                 'COL1A2', #Fibroblasts
+                 'PECAM1', #Vascular endothelium
+                 'FABP5', #Lymphatic endothelial cells
+                 'PDGFRB', #Pericytes
+                 'TAGLN', #Smooth muscle
+                 'CD68', #Macrophages
+                 'LYZ', #Monocytes
+                 'LAMP3',#Dendritic cells
+                 'KIT', #Mast cells
+                 'CD3E', 'CD8A', #Cytotoxic T cells
+                 'FOXP3', #Regulatory T cells
+                 'IGHM', #B cells
+                 'IGHG1', #Plasma cells
+                 'MKI67') #Cycling cells
+
+# Plot canonical marker gene expression in each cluster
+DotPlot(cosmx, features = marker_genes, group.by = 'SCT_snn_res.0.8')  + RotatedAxis()
+
+# Clean environment
+remove(marker_genes)
+```
+
+## SKIP: Celltype annotations of transcriptomic clusters
+```{r eval=FALSE, include=FALSE}
+# Annotate each cluster as one of 18 different cell types
+Idents(cosmx) <- 'SCT_snn_res.0.8'
+cosmx <- RenameIdents( object = cosmx,
+  '0'= 'Fibroblasts', '1'= 'Fibroblasts', '2'= 'Macrophages', '3'= 'Cytotoxic T cells', '4'= 'Tumor cells', '5'= 'Tumor cells', '6'= 'Respiratory epithelium', '7'= 'Macrophages', '8'= 'Vascular endothelium', '9'= 'Monocytes', '10'= 'Plasma cells', '11'= 'Pericytes', '12'= 'Smooth muscle cells', '13'= 'Regulatory T cells', '14'= 'Cycling immune cells', '15'= 'Basal epithelial cells', '16'= 'Dendritic cells', '17'= 'Lymphatic endothelial cells', '18'= 'Alveolar cells', '19'= 'Mast cells', '20'= 'Tumor cells', '21'= 'B cells', '22'= 'Tumor cells', '23'= 'Tumor cells')
+
+# Store cell type identities as a metadata
+cosmx$celltypes = Idents(cosmx)
+
+cosmx$celltypes= factor(as.character(cosmx$celltypes), levels = c("Tumor cells", "Respiratory epithelium", "Basal epithelial cells", "Alveolar cells", "Fibroblasts", "Vascular endothelium",  "Lymphatic endothelial cells", "Pericytes", "Smooth muscle cells", "Macrophages", "Monocytes" , "Dendritic cells",  "Mast cells" , "Cytotoxic T cells", "Regulatory T cells", "B cells",  "Plasma cells" , "Cycling immune cells"))
+```
+
+## Figure 1.c: Celltype UMAP plot
+```{r}
+# UMAP plot of segmented cells colored by cell types
+DimPlot(cosmx, group.by = 'celltypes', raster = F, label=F, cols = celltype_palette, pt.size = 0.01)+
+    ggtitle('')+ NoAxes()
+```
+
+## Supplementary Fig 1.g: Distributions of Transcripts/Area/PanCK intensity per cell across celltypes
+```{r}
+# Cellular transcript counts per celltype
+VlnPlot(cosmx, 'nCount_Spatial', pt.size = 0, log = T, group.by = 'celltypes', cols = celltype_palette) + NoLegend() + xlab('')
+
+# Cell area per celltype
+cosmx$Area_mn = cosmx$Area/(5.6**2) # Convert area in pixels2 to micron2
+VlnPlot(cosmx, 'Area_mn', pt.size = 0, log = T, group.by = 'celltypes', cols = celltype_palette) + NoLegend() + xlab('')
+
+# Cellular PanCK intensities per celltype
+VlnPlot(cosmx, 'Mean.PanCK', pt.size = 0, log = F, group.by = 'celltypes', cols = celltype_palette) + NoLegend() + xlab('')
+```
+
+## Supplementary Fig 1.h: Spatial distributions of celltypes
+```{r}
+# Spatial plot of segmented cells in section 4 colored by celltype 
+ggplot(cosmx@meta.data[cosmx$section== 'section_4', ], aes(x=x_3D_mn, y=y_3D_mn, col=celltypes))+
+  theme_void()+
+  coord_fixed() +
+  geom_point(size=0.001) +
+  scale_color_manual(values = celltype_palette) + NoLegend()
+```
+
+## Integration with published references
+
+### SKIP: Humal Lung Cell Atlas
+```{r eval=FALSE, include=FALSE}
+# Import SCT-transformed data from REF 17 Travaglini et al.
+# Originally downloaded from Synapse (syn21041850)
+HLCA = readRDS(paste0(path_to_zenodo_folder, 'single_cell_references/HLCA/hlca.rds'))
+
+# Perform Seurat Label Transfer
+obj.list= list(HLCA, cosmx)
+features <- SelectIntegrationFeatures(obj.list, nfeatures = 900)
+anchors <- FindTransferAnchors(reference = HLCA, query = cosmx, normalization.method = "SCT",  reference.assay = 'RNA_SCT', query.assay = 'SCT',
+                               reduction = 'pcaproject', dims = 1:20, features = features, nn.method= 'rann', eps = 0.5, verbose = T)
+cosmx[["HLCA"]] = TransferData(anchorset = anchors, refdata = HLCA$free_annotation, prediction.assay = TRUE, weight.reduction = 'pcaproject', dims = 1:20, eps = 0.5 )
+
+# Clean environment
+remove(HLCA, obj.list, features, anchors)
+```
+
+### SKIP: Kim et al
+```{r eval=FALSE, include=FALSE}
+# Import SCT-transformed data from REF 19 Kim et al. 
+# Originally downloaded from GEO (GSE131907)
+
+kim_et_al = readRDS(paste0(path_to_zenodo_folder, 'single_cell_references/Kim_et_al_Natcomm2021/kim_natcomm.rds')
+
+# Select only cells coming from primary lung tumors
+kim_et_al= subset(kim_et_al, cells = colnames(kim_et_al)[kim_et_al$Sample_Origin=='tLung'])
+
+# Perform Seurat Label Transfer
+obj.list= list(kim_et_al, cosmx)
+features <- SelectIntegrationFeatures(obj.list, nfeatures = 900)
+anchors <- FindTransferAnchors(reference = kim_et_al, query = cosmx, normalization.method = "SCT",  reference.assay = 'SCT', query.assay = 'SCT', reduction = 'pcaproject', dims = 1:20, features = features, nn.method= 'rann', eps = 0.5, verbose = T)
+cosmx[["Kim_et_al"]] = TransferData(anchorset = anchors, refdata = kim_et_al$Cell_subtype, prediction.assay = TRUE, weight.reduction = 'pcaproject', dims = 1:20, eps = 0.5 )
+
+# Clean environment
+remove(kim_et_al, obj.list, features, anchors)
+```
+
+## Figure 1e: UMAP plot of Label Transfer scores for selected celltypes
+```{r}
+# UMAP plot of segmented cells colored by label transfer scores for different labels in reference atlases
+DefaultAssay(cosmx)='HLCA'
+FeaturePlot(cosmx,  c("Ciliated", "Goblet", "Alveolar Fibroblast", "CD4+ Memory/Effector T", "Macrophage", "Plasma"), order = T, raster = F, cols = c('lightgrey', 'black'), ncol = 3 ) * NoLegend() * NoAxes() * coord_fixed()
+
+DefaultAssay(cosmx) = 'Kim_et_al'
+FeaturePlot(cosmx,  c("tS1", "tS2", "Tumor ECs", "Activated DCs", "Treg", "MAST"), order = T, raster = F, cols = c('lightgrey', 'black'), ncol = 3 )  * NoLegend() * NoAxes() * coord_fixed()
+```
+
+# Figure 2 and Supplementary figure 2
+
+## SKIP: Write STIM input files
+```{r eval=FALSE, include=FALSE}
+for (sect in c(4, 10, 16, 22, 28, 34)){
+  print(sect)
+  print('Reading')
+  
+  exprMat = read.csv(file = paste0(path_to_zenodo_folder, 'cosmx_flat_files/section_', sect, '/section_', sect, '_exprMat_file.csv'))
+  metadata = read.csv(paste0(path_to_zenodo_folder, 'cosmx_flat_files/section_', sect, '/section_', sect, '_metadata_file.csv'))
+
+  print('Finished reading')
+  
+  exprMat_names= paste0('section_', sect, '_fov_', exprMat$fov, '_ID_', exprMat$cell_ID)
+  exprMat= exprMat[, ! colnames(exprMat) %in%  c("fov", "cell_ID", paste0('NegPrb', 1:30))]
+  rownames(exprMat)= exprMat_names
+  
+  metadata_names = paste0('section_', sect, '_fov_',  metadata$fov, '_ID_', metadata$cell_ID)
+  rownames(metadata)= metadata_names
+  metadata$barcodes= metadata_names
+  metadata= metadata[, c('barcodes' , 'CenterX_global_px', 'CenterY_global_px')]
+  
+  colnames(metadata)= c('barcodes' , 'xcoord', 'ycoord')
+  
+  metadata$xcoord = -metadata$xcoord
+  metadata$xcoord = metadata$xcoord - min(metadata$xcoord)
+  metadata$ycoord = metadata$ycoord - min(metadata$ycoord) 
+  
+  metadata$xcoord = round(metadata$xcoord) +1 # Round and add 1 to avoid zeros
+  metadata$ycoord = round(metadata$ycoord) +1 # Round and add 1 to avoid zeros
+  
+  shared_names= intersect(metadata_names, exprMat_names)
+  
+  print('Writing')
+  dir.create(paste0(path_to_zenodo_folder, 'stim_files'))
+  write.csv(x = t(exprMat[shared_names, ]), file = paste0(path_to_zenodo_folder, 'stim_files/section_', sect, '_reads.csv'), row.names = T, quote = F)
+  write.csv(x = metadata[shared_names, ], file = paste0(path_to_zenodo_folder, 'stim_files/section_', sect, '_locations.csv'), row.names = F, quote = F)
+}
+```
+
+## SKIP: Import STIM-aligned coordinates from stimwrap (see tutorials at https://github.com/PreibischLab/STIM/ and https://github.com/rajewsky-lab/stimwrap)
+```{r eval=FALSE, include=FALSE}
+# Loop through the sections profiled with CosMx SMI
+for (sect in c(4, 10, 16, 22, 28, 34)){
+  
+  # Import aligned coordinates
+  aligned_coordinates = read.csv(paste0(path_to_zenodo_folder, 'stimwrap_files/section_', sect, '_aligned.csv'), header = F, col.names = c('x', 'y'))
+  
+  # Import cell barcodes
+  cell_metadata= read.csv( paste0(path_to_zenodo_folder, 'stim_files/section_', sect, '_celltypes.csv'), header = T)
+  rownames(aligned_coordinates) = cell_metadata$barcodes
+
+  # Add new coordinates to seurat object
+  cosmx[[paste0('section_', sect, '_aligned')]] <- new( 
+    Class = 'SlideSeq',
+    assay = "Spatial",
+    coordinates = aligned_coordinates)
+}  
+
+# Add 3D pixel coordinates to metadata 
+intersection_interval= 30 #micron
+coordinates_3D_px= rbind(data.frame(cosmx@images$section_4_aligned@coordinates, z= 0),
+      data.frame(cosmx@images$section_10_aligned@coordinates, z= intersection_interval*pixel_scale),
+      data.frame(cosmx@images$section_16_aligned@coordinates, z= intersection_interval*pixel_scale *2),
+      data.frame(cosmx@images$section_22_aligned@coordinates, z= intersection_interval*pixel_scale *3),
+      data.frame(cosmx@images$section_28_aligned@coordinates, z= intersection_interval*pixel_scale *4),
+      data.frame(cosmx@images$section_34_aligned@coordinates, z= intersection_interval*pixel_scale *5))
+
+cosmx$x_3D_px= coordinates_3D_px$x
+cosmx$y_3D_px= coordinates_3D_px$y
+cosmx$z_3D_px= coordinates_3D_px$z
+
+# Convert pixels to micron coordinates
+cosmx$x_3D_mn= cosmx$x_3D_px/pixel_scale
+cosmx$y_3D_mn= cosmx$y_3D_px/pixel_scale
+cosmx$z_3D_mn= cosmx$z_3D_px/pixel_scale
+
+# Clean environment
+remove(sect, aligned_coordinates, cell_metadata, intersection_interval, coordinates_3D_px)
+```
+
+## Figure 2.a: 3D airway plot
+```{r}
+# 3D scatterplot of respitory epithelium cells
+pl <- plot_ly()
+
+pl <- pl %>% add_trace(type = "scatter3d", 
+        mode = "markers", data = cosmx@meta.data[cosmx$celltypes== 'Respiratory epithelium', ], 
+        x = ~x_3D_mn, y = ~y_3D_mn, z = ~z_3D_mn, marker = list(size = 0.7, color=celltype_palette['Respiratory epithelium']))
+
+pl <-  pl %>% add_trace(type = "scatter3d", 
+        mode = "markers", data = cosmx@meta.data[cosmx$celltypes!= 'Respiratory epithelium', ], 
+        x = ~x_3D_mn, y = ~y_3D_mn, z = ~z_3D_mn, marker = list(size = 0.3, color='lightgrey', opacity=0.3))
+
+Noax <- list(title = "",zeroline = FALSE, showline = FALSE, showticklabels = FALSE,showgrid = FALSE)
+
+pl %>% layout(scene = list(xaxis=Noax,yaxis=Noax,zaxis=Noax), showlegend=F)
+
+# Clean environment
+remove(pl, Noax)
+```
+
+## Supplementary Figure 2.a: Cellular displacements after alignment
+```{r}
+# Calculate cell displacement in micron
+cosmx$cell_displacement = sqrt((cosmx$x_2D_mn - cosmx$x_3D_mn)**2 + (cosmx$y_2D_mn - cosmx$y_3D_mn)**2)
+round(summary(cosmx$cell_displacement[cosmx$section != 'section_4']))
+
+# Boxplot of cellular displacements per section
+ggplot(cosmx@meta.data, aes(x= section, y= cell_displacement)) + geom_boxplot() +
+  theme(panel.grid.major = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"), panel.border = element_blank()) + xlab('') + ylab("")
+```
+
+## Figure 2.b: 3D cellular neighbourhood
+```{r}
+# Select a center cell and collect its coordinates
+center_cell= 'section_22_fov_1_ID_132'
+center_coordinates = cosmx@meta.data[center_cell, c('x_3D_mn', 'y_3D_mn', 'z_3D_mn')]
+
+# Compute 3D distances with all other cells
+dist_from_center= sqrt((cosmx$x_3D_mn - center_coordinates$x_3D_mn)**2 +
+  (cosmx$y_3D_mn - center_coordinates$y_3D_mn)**2 +
+  (cosmx$z_3D_mn - center_coordinates$z_3D_mn)**2)
+
+# Celltype count
+table(cosmx$celltypes[dist_from_center <= 50])
+
+# Plot center cell
+pl <- plot_ly()
+
+pl <- pl %>% add_trace(type = "scatter3d", 
+        mode = "markers", data = center_coordinates, 
+        x = ~x_3D_mn, y = ~y_3D_mn, z = ~z_3D_mn, marker = list(size = 10, color='red'))
+
+# Plot 3D sphere 
+pl <- pl %>% add_trace(type = "scatter3d", 
+        mode = "markers", data = center_coordinates , 
+        x = ~x_3D_mn, y = ~y_3D_mn, z = ~z_3D_mn, marker = list(size = 100, color='lightgrey', opacity=0.2))
+
+# Plot 3D neighbors
+pl <- pl %>% add_trace(type = "scatter3d", 
+        mode = "markers", data = cosmx@meta.data[dist_from_center <= 50 & cosmx$celltypes %in% c('Fibroblasts', 'Tumor cells'), c('x_3D_mn', 'y_3D_mn', 'z_3D_mn')], 
+        x = ~x_3D_mn, y = ~y_3D_mn, z = ~z_3D_mn, marker= list(size = 7, color= celltype_palette[cosmx$celltypes[dist_from_center <= 50 & cosmx$celltypes %in% c('Fibroblasts', 'Tumor cells')]] , opacity=0.5))
+
+pl <- pl %>% add_trace(type = "scatter3d", 
+        mode = "markers", data = cosmx@meta.data[dist_from_center <= 50 & ! cosmx$celltypes %in% c('Fibroblasts', 'Tumor cells'), c('x_3D_mn', 'y_3D_mn', 'z_3D_mn')], 
+        x = ~x_3D_mn, y = ~y_3D_mn, z = ~z_3D_mn, marker= list(size = 7, color= 'lightgrey' , opacity=0.5))
+
+# Plot surrounding cells
+pl <- pl %>% add_trace(type = "scatter3d", 
+        mode = "markers", data =   cosmx@meta.data[dist_from_center > 50 & dist_from_center <= 100, c('x_3D_mn', 'y_3D_mn', 'z_3D_mn')],
+        x = ~x_3D_mn, y = ~y_3D_mn, z = ~z_3D_mn, marker = list(size = 3, color='lightgrey', opacity=0.5))
+
+# Remove plot axes
+Noax <- list(title = "", zeroline = FALSE, showline = FALSE, showticklabels = FALSE, showgrid = FALSE)
+
+pl %>% layout(scene = list(xaxis=Noax,yaxis=Noax,zaxis=Noax), showlegend=F)
+
+# Clean environment
+remove(center_cell, center_coordinates, dist_from_center, pl, Noax)
+```
+
+## SKIP: Import 2D and 3D cellular neighborhoods and create CosMx neighbourhood object
+```{r eval=FALSE, include=FALSE}
+# Import 2D and 3D neighborhood matrices computed with 'compute_neighborhood_matrices.py'
+path_to_output= ''
+neigh_matrix_2D= rbind(read.table(paste0(path_to_output, '2D_section_10_50um.csv'), sep = ',', header = T, row.names = 2)[, 2:25],
+                       read.table(paste0(path_to_output, '/2D_section_16_50um.csv'), sep = ',', header = T, row.names = 2)[, 2:25],
+                       read.table(paste0(path_to_output, '/2D_section_22_50um.csv'), sep = ',', header = T, row.names = 2)[, 2:25],
+                       read.table(paste0(path_to_output, '/2D_section_28_50um.csv'), sep = ',', header = T, row.names = 2)[, 2:25])
+
+neigh_matrix_3D= read.table(paste0(path_to_output, '/3D_50um.csv'), sep = ',', header = T, row.names = 2)[, 2:25]
+
+# Identify cells at the section edge
+pixel_scale=5.6
+edge_cells = c()
+
+for (sect in c('section_4', 'section_10', 'section_16', 'section_22', 'section_28', 'section_34')){
+  sect_coordinates = cosmx@images[[sect]]@coordinates
+  d= 50 * pixel_scale
+  
+  sect_coordinates$edge_cell= sect_coordinates$CenterX_global_px < min(sect_coordinates$CenterX_global_px) + d | sect_coordinates$CenterX_global_px > max(sect_coordinates$CenterX_global_px) - d | sect_coordinates$CenterY_global_px < min(sect_coordinates$CenterY_global_px) + d | sect_coordinates$CenterY_global_px > max(sect_coordinates$CenterY_global_px) - d
+  
+  edge_cells = c(edge_cells, rownames(sect_coordinates)[sect_coordinates$edge_cell] )
+} 
+
+# Remove cells with incomplete 3D neighborhoods
+cosmx$edge_cell= colnames(cosmx) %in% edge_cells
+cosmx= subset(cosmx, cells=  colnames(cosmx)[! (cosmx$section %in% c('section_4','section_34') | cosmx$edge_cell)])
+
+# Add neighborhood matrix as a new assay to Seurat object
+cosmx[['neighbourhood_2D']]= CreateAssayObject(t(neigh_matrix_2D[colnames(cosmx), ]))
+cosmx[['neighbourhood_3D']]= CreateAssayObject(t(neigh_matrix_3D[colnames(cosmx), ]))
+
+# Clean environment
+remove(edge_cells, sect, sect_coordinates, d, neigh_matrix_2D, neigh_matrix_3D, path_to_output)
+```
+
+## SKIP: Unbiased identification of 3D multicellular niches
+```{r eval=FALSE, include=FALSE}
+DefaultAssay(cosmx)= 'neighbourhood_3D'
+
+# Perform neighborhood clustering to identify niches
+cosmx= cosmx %>% 
+    RunUMAP(features= rownames(cosmx), reduction.name= 'UMAP_neighbourhood_3D') %>%
+    FindNeighbors(features= rownames(cosmx), dims=NULL) %>%
+    FindClusters(resolution=0.3)
+```
+
+## Supplementary Figure 2.b: UMAP plot of segmented cells colored by 3D neighborhood clusters
+```{r}
+DimPlot(cosmx, group.by = 'neighbourhood_3D_snn_res.0.3', reduction = 'UMAP_neighbourhood_3D', raster = F, label=F, pt.size = 0.01)+ NoAxes() + NoLegend()+ coord_fixed() + ggtitle('')
+```
+
+## Supplementary Figure 2.c: Heatmap of average neighbourhood count per 3D neighborhood cluster
+```{r warning=FALSE}
+# Set cluster order before plotting
+cosmx$neighbourhood_3D_snn_res.0.3 = factor(as.character(cosmx$neighbourhood_3D_snn_res.0.3), levels = c(4, 1, 5, 8, 6, 0, 2, 7, 9,11,3, 10, 12))
+celltype_order= c("Tumor-cells", "Respiratory-epithelium", 'Basal-epithelial-cells', 'Alveolar-cells','Fibroblasts',  'Plasma-cells', 'Vascular-endothelium', 'Pericytes', 'Smooth-muscle-cells', 'Macrophages', 'Monocytes', "Cycling-immune-cells", 'Cytotoxic-T-cells', "Lymphatic-endothelial-cells",'Regulatory-T-cells', 'Dendritic-cells', 'B-cells')
+
+# Compute average niche composition
+cluster_composition= AverageExpression(cosmx, assays = 'neighbourhood_3D', slot = 'count', group.by = 'neighbourhood_3D_snn_res.0.3')$neighbourhood_3D
+cluster_composition[cluster_composition>30] = 30
+pheatmap(cluster_composition[celltype_order, ], cluster_rows = F, cluster_cols = F, display_numbers = F, number_format = "%.0f")
+remove(cluster_composition)
+```
+
+## SKIP: Niche annotations of 3D neighborhood clusters
+```{r eval=FALSE, include=FALSE}
+Idents(cosmx) <- 'neighbourhood_3D_snn_res.0.3'
+
+cosmx <- RenameIdents(object = cosmx, '0'= 'Desmoplastic stroma','1'= 'Tumor surface', '2'= 'Vascular stroma', '3'= 'T cell niches','4'= 'Tumor core', '5'= 'Airways', '6'= 'Alveoli', '7'= 'Smooth muscle', '8'= 'Airways', '9'= 'Macrophage niches', '10'= 'T cell niches', '11'= 'Dendritic cell niches', '12'= 'T cell niches')
+cosmx$niches_3D = Idents(cosmx)
+
+cosmx$niches_3D= factor(cosmx$niches_3D, levels = c('Tumor core','Tumor surface','Airways', 'Alveoli', 'Desmoplastic stroma', 'Vascular stroma','Smooth muscle', 'Macrophage niches','Dendritic cell niches', 'T cell niches'))
+```
+
+## Figure 2.c: UMAP plot of multicellular niches
+```{r warning=FALSE}
+DimPlot(cosmx,  group.by = 'niches_3D', reduction = 'UMAP_neighbourhood_3D', raster = F, label=F, cols = niche_palette, pt.size = 0.01)+ NoAxes() + NoLegend()+ coord_fixed()+ ggtitle('')
+```
+
+## Fig 2.d: Heatmap of average neighbourhood composition per niche
+```{r warning=FALSE}
+# Compute average niche composition
+niche_composition= AverageExpression(cosmx, assays = 'neighbourhood_3D', slot = 'count', group.by = 'niches_3D')$neighbourhood_3D
+niche_composition[niche_composition>30] = 30
+pheatmap(niche_composition[celltype_order, ], cluster_rows = F, cluster_cols = F, display_numbers = F, number_format = "%.0f")
+remove(niche_composition)
+```
+
+## Supplementary Figure 2.d: Distribution of cells and celltypes per 3D neighbourhood across multicellular niches
+```{r warning=FALSE}
+# Total count of cells per 3D neighborhood  in multicellular niches 
+VlnPlot(cosmx, features = 'nCount_neighbourhood_3D', pt.size = 0, group.by = 'niches_3D', cols = niche_palette) + NoLegend() + ggtitle('Total neighbour count')
+
+# Total count of different celltypes per 3D neighborhood  in multicellular niches 
+VlnPlot(cosmx, features = 'nFeature_neighbourhood_3D', pt.size = 0, group.by = 'niches_3D', cols = niche_palette, adjust=3) + NoLegend() + ggtitle('Cell type count')
+```
+
+## Figure 2e: Spatial plot of 3D multicellular niches
+```{r}
+# Spatial plot of segmented cells in section 10 colored by niche assignment 
+ggplot(cosmx@meta.data[cosmx$section== 'section_10', ], aes(x=x_2D_mn, y=y_2D_mn, col=niches_3D))+
+  theme_void()+
+  geom_point(size=0.001) +
+  coord_fixed() +
+  scale_color_manual(values = niche_palette, na.value = 'lightgrey') + NoLegend()
+```
+
+# Figure 3 and Supplementary figure 3
+
+## SKIP: 3D neighborhood ecology
+```{r eval=FALSE, warning=FALSE, include=FALSE}
+# Compute alpha diversity in 2 and 3D neighborhoods using phyloseq
+alpha_diversity_2D= otu_table(object = as.matrix(cosmx@assays$neighbourhood_2D@counts), taxa_are_rows = T) %>% estimate_richness(measures = "Chao1")
+cosmx$alpha_diversity_2D = alpha_diversity_2D$Chao1
+
+alpha_diversity_3D= otu_table(object = as.matrix(cosmx@assays$neighbourhood_3D@counts), taxa_are_rows = T) %>% estimate_richness(measures = "Chao1")
+cosmx$alpha_diversity_3D = alpha_diversity_3D$Chao1
+
+remove(alpha_diversity_2D, alpha_diversity_3D)
+```
+
+## Quantification of cell/celltype count distributions in 2D/3D neighburhoods
+```{r}
+summary(cosmx$nCount_neighbourhood_2D)
+summary(cosmx$nFeature_neighbourhood_3D)
+
+summary(cosmx$nCount_neighbourhood_3D)
+summary(cosmx$nFeature_neighbourhood_3D)
+
+summary(cosmx$alpha_diversity_2D)
+summary(cosmx$alpha_diversity_3D)
+```
+
+## Figure 3.b: Comparison of cell/celltype count and alpha diversity distributions in 2D vs 3D neighburhoods
+```{r}
+my_comparisons <- list( c("2D", "3D") )
+
+rbind(data.frame( neighbours= cosmx$nCount_neighbourhood_2D, celltypes= cosmx$nFeature_neighbourhood_2D, diversity= cosmx$alpha_diversity_2D, dimensionality='2D'), 
+      data.frame(neighbours= cosmx$nCount_neighbourhood_3D, celltypes= cosmx$nFeature_neighbourhood_3D, diversity= cosmx$alpha_diversity_3D, dimensionality='3D')) %>%
+  pivot_longer(cols= 1:3, names_to = 'variables', values_to = 'values') %>%
+  ggplot(aes(x= dimensionality, y= values))+
+  geom_violin(adjust=3, draw_quantiles = 0.5)+
+  ggpubr::stat_compare_means(comparisons = my_comparisons, method = 't.test' ) +
+  theme(panel.grid.major = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"), panel.border = element_blank())+
+  facet_wrap('variables', scales = 'free_y')
+remove(my_comparisons)
+```
+
+## SKIP: Unbiased identification of 2D multicellular niches
+```{r eval=FALSE, include=FALSE}
+DefaultAssay(cosmx)= 'neighbourhood_2D'
+
+# Perform neighborhood clustering to identify niches
+cosmx= cosmx %>% 
+    RunUMAP(features= rownames(cosmx), reduction.name= 'UMAP_neighbourhood_2D') %>%
+    FindNeighbors(features= rownames(cosmx), dims=NULL) %>%
+    FindClusters(resolution=0.3)
+```
+
+## Supplementary Figure 3.a: UMAP plot of 2D neighbourhood clusters
+```{r warning=FALSE}
+DimPlot(cosmx, raster = F, label=T, pt.size = 0.01, group.by = 'neighbourhood_2D_snn_res.0.3', reduction= 'UMAP_neighbourhood_2D')+ NoAxes() + NoLegend() + ggtitle('') +coord_fixed()
+```
+
+## Supplementary Figure 3.b: Heatmap of average neighbourhood count per 2D neighborhood cluster
+```{r warning=FALSE}
+# Set cluster order before plotting
+cosmx$neighbourhood_2D_snn_res.0.3 =factor(as.character(cosmx$neighbourhood_2D_snn_res.0.3), levels = c(13, 8, 10, 2, 3, 12, 5, 7,  0, 1, 9, 6, 11, 4, 14))
+
+# Compute average niche composition
+cluster_composition= AverageExpression(cosmx, assays = 'neighbourhood_2D', slot = 'count', group.by = 'neighbourhood_2D_snn_res.0.3')$neighbourhood_2D
+cluster_composition[cluster_composition>30] = 30
+pheatmap(t(cluster_composition[celltype_order, ]), cluster_rows = F, cluster_cols = F, display_numbers = F, number_format = "%.0f")
+remove(celltype_order, cluster_composition)
+```
+
+## SKIP: Annotation of 2D multicellular niches
+```{r eval=FALSE, include=FALSE}
+Idents(cosmx) <- 'neighbourhood_2D_snn_res.0.3'
+cosmx <- RenameIdents( object = cosmx, '0'= 'Desmoplastic stroma', '1'= 'Vascular stroma', '2'= 'Tumor surface', '3'= 'Tumor surface', '4'=  'T cell niches', '5'= 'Airways', '6'=  'Macrophage-rich stroma', '7'= 'Alveoli', '8'= 'Tumor core', '9'= 'Smooth muscle', '10'= 'Tumor core', '11'=  'Macrophage niches', '12'= 'Airways', '13'= 'Tumor core', '14'= 'T cell niches')
+cosmx$niches_2D = Idents(cosmx)
+```
+
+## Figure 3.c: UMAP plot of 2D multicellular niches
+```{r warning=FALSE}
+DimPlot(cosmx, raster = F, label=F, group.by = 'niches_2D', reduction= 'UMAP_neighbourhood_2D', pt.size = 0.01, cols= niche_palette)+ NoAxes() + NoLegend()+ ggtitle('') + coord_fixed()
+```
+
+## Supplementary figure 3.c: Spatial plot of 2D multicellular niches
+```{r}
+# Spatial plot of segmented cells in section 10 colored by niche assignment 
+ggplot(cosmx@meta.data[cosmx$section== 'section_10', ], aes(x=x_2D_mn, y=y_2D_mn, col=niches_2D))+
+  theme_void()+
+  geom_point(size=0.001) +
+  coord_fixed() +
+  scale_color_manual(values = niche_palette, na.value = 'lightgrey') + NoLegend()
+```
+
+## Figure 3.d: Alluvial plot of 2D vs 3D niche assignments
+```{r}
+for_alluvial= cosmx@meta.data[!is.na(cosmx$niches_3D), c('barcodes', 'niches_2D', 'niches_3D')] %>%
+  pivot_longer(cols=2:3, names_to = 'dimensionality',values_to = 'niches') 
+
+for_alluvial$niches= factor(for_alluvial$niches, levels = c('Airways', 'Alveoli', 'Smooth muscle','Vascular stroma', 'Desmoplastic stroma','Macrophage-rich stroma', 
+'T cell niches','Macrophage niches', 'Dendritic cell niches','Tumor surface','Tumor core'))
+for_alluvial$dimensionality= factor(for_alluvial$dimensionality, levels = c('niches_3D', 'niches_2D') )
+
+for_alluvial %>%
+  ggplot(aes(x = dimensionality, stratum = niches, alluvium = barcodes, fill= niches, label= niches)) +
+  geom_flow() + geom_stratum() +
+  scale_fill_manual(values = c(niche_palette) ) +
+  NoLegend() +
+  theme(panel.grid.major = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"), panel.border = element_blank()) + xlab('') + ylab("")
+remove(for_alluvial)
+```
+
+## Quantification of niche reassignment from 3D to 2D
+```{r}
+cosmx$reassigned_2D= as.character(cosmx$niches_3D) != as.character(cosmx$niches_2D)
+round(prop.table(table(cosmx$reassigned_2D))*100, digits=1)
+round(prop.table(table(cosmx$niches_3D, cosmx$reassigned_2D), margin = 1)*100, digits=1)
+```
+
+## Supplementary figure 3.d: Spatial plot of Tumor cells, Dendritic cells and Macrophages in section 28
+```{r fig.width=8, fig.height=8}
+# Spatial plot of Tumor, Macrophages and Dendritic cells in section 28 
+ggplot(cosmx@meta.data[cosmx$section== 'section_28', ], aes(x=x_2D_mn, y=y_2D_mn))+
+  theme_void()+
+  geom_point(size=0.001, col= 'darkblue') +
+  geom_point(data = cosmx@meta.data[cosmx$section=='section_28' & cosmx$celltypes =='Macrophages',],
+             mapping= aes(x=x_2D_mn, y=y_2D_mn),size=0.1, col= 'cyan') +
+  geom_point(data = cosmx@meta.data[cosmx$section=='section_28' & cosmx$celltypes %in% c('Tumor cells', 'Respiratory epithelium', 'Basal epithelial cells','Alveolar cells'),],
+             mapping= aes(x=x_2D_mn, y=y_2D_mn),size=0.1, col= 'magenta') +
+  geom_point(data = cosmx@meta.data[cosmx$section=='section_28' & cosmx$celltypes =='Dendritic cells',],
+             mapping= aes(x=x_2D_mn, y=y_2D_mn),size=0.1, col= 'yellow') +
+  coord_fixed() + NoLegend() + theme(panel.background = element_rect(fill = 'black'))
+```
+
+# Figure 4 and Supplementary figure 4
+
+## SKIP: Compute ligand-receptor interaction scores per pair of neighbouring cells
+```{r eval=FALSE, include=FALSE}
+#Create 3D Giotto object 
+library(Giotto)
+
+# Create a 3D matrix for each barcode (x, y, z)
+cosmx_3D = createGiottoObject(raw_exprs = as.matrix(cosmx@assays$SCT@counts),
+                                      spatial_locs = cosmx@meta.data[, c("x_3D_px", "y_3D_px", "z_3D_px")],
+                                      cell_metadata = cosmx@meta.data)
+
+# Build 3D graph
+cosmx_3D = createSpatialNetwork(gobject = cosmx_3D, name= 'k100_r50_3D', dimensions='all', method='kNN', k=100, maximum_distance_knn=50*5.6, verbose=T)
+network= cosmx_3D@spatial_network$k100_r50_3D$networkDT
+network$pair_ID= paste0(network$from, '_', network$to)
+
+#Import RL interactions from CellChat
+LR_data = CellChat::CellChatDB.human$interaction
+lr_db= apply(LR_data, MARGIN = 1, function(row){
+        int= as.character(row['interaction_name_2'])
+        lig= strsplit(int, split = ' - ')[[1]][1]
+        rec= strsplit(int, split = ' - ')[[1]][2]
+        if (grepl('(', rec, fixed = TRUE)) {
+          rec= gsub("[()]", "", rec)
+          rec= strsplit(x = rec, split = '+', fixed = T)[[1]]
+        }
+        
+        return(paste0(lig, '___', rec, '___', row['annotation']  ))
+      } ) 
+
+lr_db= t(as.data.frame(strsplit(unlist(lr_db), split = '___')))
+rownames(lr_db)= 1: nrow(lr_db)
+colnames(lr_db)= c('ligand', 'receptor', 'annotation')
+lr_db= as.data.frame(lr_db)
+
+# Remove homologoues interactions and interactions not measured
+lr_db = lr_db[lr_db$ligand %in% rownames(cosmx) & lr_db$receptor %in% rownames(cosmx)D,  ]
+lr_db= lr_db[!duplicated(lr_db), ]
+
+# Compute ligand-receptor geometric mean per ligand-receptor and cell-cell pair
+interaction_score = function(pair, network){
+    ligand= pair[1]
+    receptor= pair[2]
+    pair_expression = cosmx_3D@raw_exprs[c(ligand, receptor), unique(network$to)] %>% as.data.frame()
+    pair_expression$gene= rownames(pair_expression)
+    pair_expression = pair_expression %>% pivot_longer(cols = 1:ncol(pair_expression)-1, names_to = 'barcodes', values_to = 'expression')
+    pair_expression= pair_expression[pair_expression$expression>0,]
+    network_expr = left_join(network[, 1:2], pair_expression[pair_expression$gene== ligand, ], by=c('from'='barcodes') )
+    colnames(network_expr) = gsub('gene', 'ligand', colnames(network_expr))
+    colnames(network_expr) = gsub('expression', 'ligand_expr', colnames(network_expr))
+    network_expr = left_join(network_expr, pair_expression[pair_expression$gene== receptor, ], by=c('to'='barcodes') )
+    colnames(network_expr) = gsub('gene', 'receptor', colnames(network_expr))
+    colnames(network_expr) = gsub('expression', 'receptor_expr', colnames(network_expr))
+    network_expr= network_expr[complete.cases(network_expr), ]
+    network_expr$RL_mean= apply(network_expr[, c('ligand_expr', 'receptor_expr')], MARGIN = 1, function(x){exp(mean(log(x)))})
+    summary(network_expr$RL_mean)
+    network_expr$interaction= paste0(ligand, '___', receptor)
+    return(network_expr)
+}
+
+lr_scores = apply(lr_db, MARGIN = 1, function(pair){
+    network= left_join(network, interaction_score(pair = pair, network = network))
+    network= network[complete.cases(network), ]
+} )
+
+lr_scores = bind_rows(lr_scores)
+
+# Add information about sending and receiving celltype for each pair
+lr_scores = left_join(lr_scores, cosmx@meta.data[, c('celltypes', 'barcodes')],by= c('from'='barcodes'))
+colnames(lr_scores)[18]= c('celltypes_from')
+
+lr_scores = left_join(lr_scores, cosmx@meta.data[, c('celltypes', 'barcodes')],by= c('to'='barcodes'))
+colnames(lr_scores)[19]= c('celltypes_to')
+
+# Aggregate ligand scores at the single cell level
+sender_matrix= lr_scores %>% group_by(from, ligand) %>% summarise(interaction_score= sum(RL_mean))
+sender_matrix= sender_matrix %>% pivot_wider(names_from = 'from', values_from = 'interaction_score', values_fill = 0) %>% as.data.frame()
+rownames(sender_matrix)= sender_matrix$ligand
+sender_matrix$ligand= NULL
+
+# Add missing cells
+missing_cells= colnames(cosmx)[!colnames(cosmx) %in% colnames(sender_matrix)]
+missing_senders= array(0, dim = c(nrow(sender_matrix), length(missing_cells)))
+colnames(missing_senders)= missing_cells
+sender_matrix= cbind(sender_matrix, missing_senders)
+
+# Store as a separate assay
+cosmx[['ligand_to_matrix']]= CreateAssayObject(sender_matrix[, colnames(cosmx)])
+remove(missing_cells, missing_senders, sender_matrix)
+
+# Aggregate interaction score sent at the single cell level
+sender_matrix= lr_scores %>% group_by(from, interaction) %>% summarise(interaction_score= sum(RL_mean))
+sender_matrix= sender_matrix %>% pivot_wider(names_from = 'from', values_from = 'interaction_score', values_fill = 0) %>%as.data.frame()
+rownames(sender_matrix)= sender_matrix$interaction
+sender_matrix$interaction= NULL
+
+# Add missing cells
+missing_cells= colnames(cosmx)[!colnames(cosmx) %in% colnames(sender_matrix)]
+missing_senders= array(0, dim = c(nrow(sender_matrix), length(missing_cells)))
+colnames(missing_senders)= missing_cells
+sender_matrix= cbind(sender_matrix, missing_senders)
+
+# Store as a separate assay
+cosmx[['interaction_to_matrix']]= CreateAssayObject(sender_matrix[, colnames(cosmx)])
+
+# Aggregate interaction score received at the single cell level
+receiver_matrix= lr_scores %>% group_by(to, interaction) %>% summarise(interaction_score= sum(RL_mean))
+receiver_matrix= receiver_matrix %>% pivot_wider(names_from = 'to', values_from = 'interaction_score', values_fill = 0) %>%as.data.frame()
+rownames(receiver_matrix)= receiver_matrix$interaction
+receiver_matrix$interaction= NULL
+
+# Add missing cells
+missing_cells= colnames(cosmx)[!colnames(cosmx) %in% colnames(receiver_matrix)]
+missing_recipients= array(0, dim = c(nrow(receiver_matrix), length(missing_cells)))
+colnames(missing_recipients)= missing_cells
+receiver_matrix= cbind(receiver_matrix, missing_recipients)
+
+# Store as a separate assay
+cosmx[['interaction_from_matrix']]= CreateAssayObject(receiver_matrix[, colnames(cosmx)])
+
+# Clean environment
+remove(missing_cells,missing_recipients, receiver_matrix, missing_senders, sender_matrix)
+```
+
+## Identify niche-specific ligands
+```{r}
+# Define function to compute log2 fold changes and percentage differences between 2 populations
+findmarkers = function(ligand_matrix= NULL, group_1_cells=NULL, group_2_cells=NULL ){
+  group_1_avg= rowMeans(ligand_matrix[, group_1_cells])
+  pct.1= rowMeans(ligand_matrix[, group_1_cells]>0)
+  
+  
+  group_2_avg= rowMeans(ligand_matrix[, group_2_cells])
+  pct.2= rowMeans(ligand_matrix[, group_2_cells]>0)
+  
+  avg_log2FC= log2(group_1_avg/ group_2_avg)
+  ligand_markers= data.frame(avg_log2FC, pct.1, pct.2, gene= rownames(ligand_matrix) )
+  ligand_markers$log2FC= abs(ligand_markers$avg_log2FC)
+  ligand_markers$perc_difference= ligand_markers$pct.1- ligand_markers$pct.2
+  remove(group_1_avg, pct.1, group_2_avg, pct.2, avg_log2FC)
+  return(ligand_markers)
+}
+
+# Extract ligand matrix
+ligand_matrix= GetAssayData(cosmx, assay = 'ligand_to_matrix')[, !is.na(cosmx$niches_3D)]
+
+# Identify niche-specific ligands
+niche_specific_ligand_to_3D = list()
+for (niche in levels(cosmx$niches_3D)){
+  group_1_cells= cosmx$barcodes[cosmx$niches_3D==niche & !is.na(cosmx$niches_3D)]
+  group_2_cells= cosmx$barcodes[cosmx$niches_3D!=niche & !is.na(cosmx$niches_3D)]
+  ligand_markers= findmarkers(ligand_matrix,group_1_cells, group_2_cells)
+  ligand_markers$cluster=  niche
+  niche_specific_ligand_to_3D[[niche]]= ligand_markers
+  remove(group_1_cells, group_2_cells, ligand_markers)
+}
+niche_specific_ligand_to_3D= bind_rows(niche_specific_ligand_to_3D)
+```
+
+## Figure 4.b: Heatmap of the top 5 niche-specific ligands
+```{r}
+# Define top 5 ligands per niche
+top_5 <- niche_specific_ligand_to_3D[niche_specific_ligand_to_3D$pct.1>0.1,] %>% group_by(cluster) %>% top_n(n = 5, wt= avg_log2FC) %>% select(gene)
+
+# Compute average ligand scores per niche
+avg_ligand_per_niche= rowGrpMeans(as.data.frame(ligand_matrix[unique(top_5$gene),]), grp= cosmx$niches_3D[colnames(ligand_matrix)],  na.rm = TRUE)
+
+# Plot heatmap
+pheatmap(avg_ligand_per_niche[unique(top_5$gene), ],  scale= 'row', cluster_rows = F, cluster_cols = F, border_color = NA, fontsize_row = 5)
+
+# Clean environment
+remove(top_5, ligand_matrix, avg_ligand_per_niche)
+```
+
+## Supplementary figure 4.a: Vulcano plot of niche-specific ligands
+```{r}
+ggplot(niche_specific_ligand_to_3D, aes(x= perc_difference, y= log2FC, col= perc_difference> 0.05))+
+  geom_point()+
+  ggrepel::geom_text_repel(niche_specific_ligand_to_3D[niche_specific_ligand_to_3D$perc_difference> 0.05, ], mapping=aes(x= perc_difference, y= log2FC, label=  gene), col= 'black', min.segment.length = 0, max.overlaps = 50, size= 2) +
+  facet_wrap('cluster', nrow = 2) + NoLegend()+
+  theme(panel.grid.major = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"), panel.border = element_blank())+
+  geom_vline(xintercept = 0.05, linetype= 2) + 
+  geom_hline(yintercept = 1, linetype= 2)  
+remove(niche_specific_ligand_to_3D)
+```
+
+## Supplementary figure 4.b: Heatmap of celltype enrichments in 3D niches
+```{r}
+niche_assignments= cosmx@meta.data[!is.na(cosmx$niches_3D), c('celltypes', 'niches_3D')]
+
+observed= niche_assignments %>% group_by(celltypes, niches_3D) %>% summarise(observed= length(celltypes) ) %>% as.data.frame()
+freq_niches= niche_assignments %>% group_by(niches_3D) %>% summarise(freq_niches= length(celltypes) ) %>% as.data.frame()
+freq_celltypes= niche_assignments %>% group_by(celltypes) %>% summarise(freq_celltypes= length(celltypes) ) %>% as.data.frame()
+
+niche_enrichments= left_join(left_join(observed, freq_celltypes), freq_niches)
+niche_enrichments$expected= niche_enrichments$freq_celltypes * (niche_enrichments$freq_niches / nrow(niche_assignments))
+niche_enrichments$fold_change= log2(niche_enrichments$observed/niche_enrichments$expected)
+summary(niche_enrichments$fold_change)
+
+niche_enrichments$fold_change[niche_enrichments$fold_change> 1.5]=1.5
+niche_enrichments$fold_change[niche_enrichments$fold_change< -1.5]= -1.5
+
+niche_enrichments= pivot_wider(niche_enrichments[, c('celltypes', 'niches_3D', 'fold_change')], names_from = 'niches_3D',  values_from = 'fold_change' ) %>% as.data.frame()
+rownames(niche_enrichments)= niche_enrichments$celltypes
+niche_enrichments$celltypes= NULL
+pheatmap(niche_enrichments[c('Respiratory epithelium', 'Basal epithelial cells','Alveolar cells', 'Vascular endothelium', 'Pericytes', 'Monocytes', 'Mast cells', 'Smooth muscle cells', 'Fibroblasts', 'Plasma cells', 'Tumor cells','Macrophages','Cycling immune cells', 'Dendritic cells', 'Regulatory T cells', 'Lymphatic endothelial cells', 'Cytotoxic T cells','B cells'), c('Airways', 'Alveoli', 'Vascular stroma', 'Smooth muscle', 'Desmoplastic stroma', 'Tumor core', 'Tumor surface', 'Macrophage niches', 'Dendritic cell niches',  'T cell niches')] ,color = divergent_palette, display_numbers = F, number_color = 'white', angle_col = 45, cluster_cols = F, cluster_rows = F)
+remove(niche_assignments, observed, freq_niches, freq_celltypes, niche_enrichments)
+```
+
+## Supplementary figure 4.c: Vulcano plot of receptor-ligand interactions in dendritic niches
+```{r}
+interaction_matrix= GetAssayData(cosmx, assay = 'interaction_to_matrix')[, !is.na(cosmx$niches_3D)]
+
+niche_specific_interaction_to_3D = list()
+
+for (niche in levels(cosmx$niches_3D)){
+  group_1_cells= cosmx$barcodes[cosmx$niches_3D==niche & !is.na(cosmx$niches_3D)]
+  group_2_cells= cosmx$barcodes[cosmx$niches_3D!=niche & !is.na(cosmx$niches_3D)]
+  ligand_markers= findmarkers(interaction_matrix,group_1_cells, group_2_cells )
+  ligand_markers$cluster=  niche
+  niche_specific_interaction_to_3D[[niche]]= ligand_markers
+}
+niche_specific_interaction_to_3D= bind_rows(niche_specific_interaction_to_3D)
+remove(interaction_matrix)
+```
+
+```{r}
+ggplot(niche_specific_interaction_to_3D[niche_specific_interaction_to_3D$cluster=='Dendritic cell niches',], aes(x= perc_difference, y= log2FC, col= perc_difference>0.05 )) + 
+  geom_point()+
+  scale_color_manual(values= c('FALSE'= 'grey', 'TRUE'='red'))+
+  ggrepel::geom_text_repel(niche_specific_interaction_to_3D[niche_specific_interaction_to_3D$cluster=='Dendritic cell niches' &niche_specific_interaction_to_3D$log2FC>0.5 & niche_specific_interaction_to_3D$perc_difference>0.05, ], mapping=aes(x= perc_difference, y= log2FC, label=  gene), col= 'black', min.segment.length = 0, max.overlaps = 20) +
+  theme(panel.grid.major = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"), panel.border = element_blank())+
+  NoLegend()+ 
+  geom_hline(yintercept = 0.5, linetype= 2) +
+  geom_vline(xintercept = 0.05, linetype= 2)
+remove(niche_specific_interaction_to_3D)
+```
+
+## Figure 4.f: Dotplot of senders and receivers of dendritic niche-specific receptor-ligand interactions
+```{r warning=FALSE}
+DC_niches= subset(cosmx, cells= colnames(cosmx)[cosmx$niches_3D=='Dendritic cell niches'] )
+Idents(DC_niches)='celltypes'
+DC_interactions= c("CXCL9---CXCR3","CCL19---CCR7","CCL21---CCR7", "MIF---CXCR4", "CD80---CTLA4","CD274---PDCD1","LGALS9---HAVCR2")
+
+table(cosmx$celltypes[cosmx$niches_3D=='Dendritic cell niches'])# Keep celltypes with > 100 cells
+
+a <- DotPlot( DC_niches, features = DC_interactions, assay = 'interaction_from_matrix',  idents = c('Tumor cells', 'Fibroblasts', 'Macrophages', 'Lymphatic endothelial cells', 'Dendritic cells', 'Cytotoxic T cells', 'Regulatory T cells' ))+ RotatedAxis() 
+a$data$assay= 'ab_R'
+
+b <- DotPlot( DC_niches, features = DC_interactions, assay = 'interaction_to_matrix',idents = c('Tumor cells', 'Fibroblasts', 'Macrophages', 'Lymphatic endothelial cells', 'Dendritic cells', 'Cytotoxic T cells', 'Regulatory T cells' ))+ RotatedAxis() 
+b$data$assay= 'aa_S' 
+
+dotplot_data= rbind(a$data[, c('pct.exp', 'id', 'avg.exp.scaled', 'assay', 'features.plot')],
+                    b$data[, c('pct.exp', 'id', 'avg.exp.scaled', 'assay', 'features.plot')])
+dotplot_data$perc= unlist(lapply(dotplot_data$pct.exp, function(x){min(x, 50)}))
+dotplot_data$features.plot= factor(dotplot_data$features.plot , levels= DC_interactions )
+dotplot_data= dotplot_data[dotplot_data$pct.exp >5, ]
+
+ggplot()+
+  geom_point(data= dotplot_data[dotplot_data$assay == 'aa_S', ], mapping= aes(x=assay, y=id, col=avg.exp.scaled, size=perc))+
+  scale_color_gradient(low='lightgrey', high='orange', limits=c(-0.5, 1), na.value = 'orange') +
+  ggnewscale::new_scale_color() +
+  geom_point(data= dotplot_data[dotplot_data$assay == 'ab_R', ], mapping= aes(x=assay, y=id, col=avg.exp.scaled, size=perc))+
+  scale_color_gradient(low='lightgrey', high='blue', limits=c(-0.5, 1), na.value = 'blue') +
+  theme(panel.grid.major = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"), panel.border = element_blank()) +
+  facet_wrap('features.plot', nrow = 1) +
+  xlab('') + ylab('') +RotatedAxis()
+
+# Clean environment
+remove(DC_niches, DC_interactions, a,b, dotplot_data)
+```
+
+## Supplementary figure 4.d: Spatial density of cytotoxic T cells 
+```{r}
+ggplot(cosmx@meta.data[cosmx$celltypes=='Cytotoxic T cells' & cosmx$section=='section_10', ],
+       aes(x=x_3D_px, y=y_3D_px ))+
+  geom_point(size=0.01, col= 'black')+
+  geom_density_2d_filled(alpha = 0.5, h= 5.6 * 700)+
+  theme_void()+
+  coord_fixed()+
+  NoLegend()
+```
+
+# Figure 5 and Supplementary figure 5
+
+## Figure 5.a: Second harmonic imaging
+```{r}
+# Import TIFF collagen image
+collagen= readTIFF(paste0(path_to_zenodo_folder, 'SHG/Collagen.tif'))
+
+# Normalize intensities between 0 and 1
+collagen= (collagen - min(collagen))/(max(collagen) - min(collagen))
+
+# Import TIFF elastin image
+elastin= readTIFF(paste0(path_to_zenodo_folder, 'SHG/Elastin.tif'))
+
+# Normalize intensities between 0 and 1
+elastin= (elastin - min(elastin))/(max(elastin) - min(elastin))
+
+# Plot merged image
+plot(as.raster( array( c(1, elastin, collagen), dim = c(1320, 1320, 3)   )))
+```
+
+## Quantify ECM composition in cellular neighborhoods
+```{r}
+# Read aligned coordinates
+coordinates= read.csv(paste0(path_to_zenodo_folder, 'SHG/coordinates.csv'))
+
+# Scale and align coordinates from CosMx to SHG
+coordinates$x= ( (coordinates$xc-min(coordinates$xc)) /(max(coordinates$xc)-min(coordinates$xc))  ) *1320
+coordinates$y= ((coordinates$yc-min(coordinates$yc))/ (max(coordinates$yc)-min(coordinates$yc))   )  *1320
+
+coordinates$imagerow= abs(-coordinates$y)
+coordinates$imagecol= abs(coordinates$x - max(coordinates$x) )
+
+# Add cell barcodes
+coordinates$barcodes= cosmx$barcodes[cosmx$section=='section_4'] #rownames(cosmx@images$section_4@coordinates)
+
+# Add metadata
+coordinates= inner_join(coordinates, cosmx@meta.data[, c('barcodes', 'celltypes')], by= 'barcodes')
+
+# Set a 50 µm edge
+r=50 * 4000/1320
+intensities= array( c(elastin, collagen, 1), dim = c(1320, 1320, 3))
+
+# Average collagen intensity over a 50x50 micron neighbourhood
+coordinates$collagen_mean =  apply(coordinates, MARGIN = 1, function(x){
+  xcoord= as.numeric(x['imagerow'])
+  ycoord= as.numeric(x['imagecol'])
+  
+  xrange= max(0, (xcoord - r)) : min((xcoord + r), 1320)
+  yrange= max(0, (ycoord - r)) : min((ycoord + r), 1320)
+  
+  crop= intensities[xrange, yrange, 2]
+  return(mean(crop))
+  })
+
+# Average elastin intensity over a 50x50 micron neighbourhood
+coordinates$elastin_mean =  apply(coordinates, MARGIN = 1, function(x){
+  xcoord= as.numeric(x['imagerow'])
+  ycoord= as.numeric(x['imagecol'])
+  
+  xrange= max(0, (xcoord - r)) : min((xcoord + r), 1320)
+  yrange= max(0, (ycoord - r)) : min((ycoord + r), 1320)
+  
+  crop= intensities[xrange, yrange, 1]
+  return(mean(crop))
+  })
+
+# Scale elastin and collagen intensities
+coordinates$elastin_scaled= as.numeric(scale(coordinates$elastin_mean, center = T))
+coordinates$collagen_scaled= as.numeric(scale(coordinates$collagen_mean, center = T))
+remove(elastin, collagen, intensities, r)
+```
+
+## Supplementary figure 5.b: Screeplot to identify an adequate number of ECM clusters
+```{r warning=FALSE}
+# Decide how many clusters to look at
+n_clusters <- 10
+
+# Initialize total within sum of squares error: wss
+wss <- numeric(n_clusters)
+set.seed(123)
+
+# Look over 1 to 10 possible clusters
+for (i in 1:n_clusters) {
+  # Fit the model: km.out
+  km.out <- kmeans(coordinates[, c('elastin_scaled', 'collagen_scaled')], centers = i, nstart = 20)
+  # Save the within cluster sum of squares
+  wss[i] <- km.out$tot.withinss
+}
+
+# Produce a scree plot
+wss_df <- tibble(clusters = 1:n_clusters, wss = wss)
+ 
+ggplot(wss_df, aes(x = clusters, y = wss, group = 1)) +
+    geom_point(size = 4)+
+    geom_line() +
+    scale_x_continuous(breaks = c(2, 4, 6, 8, 10)) +
+    xlab('Number of clusters') +theme_bw()
+remove(n_clusters, wss, km.out, wss_df, i)
+```
+
+## Figure 5.b: Scatter plot of elastin and collagen content in cellular neighborhoods
+```{r}
+km.res <- kmeans(coordinates[, c('elastin_scaled', 'collagen_scaled')], centers = 3, nstart = 25)
+coordinates$ECM_clusters = as.factor(km.res$cluster)
+
+new_clusters= as.character(coordinates$ECM_clusters)
+new_clusters[coordinates$ECM_clusters==2]=3
+new_clusters[coordinates$ECM_clusters==3]=2
+coordinates$ECM_clusters= new_clusters
+
+ggplot(coordinates,
+       aes(x= elastin_scaled, y=collagen_scaled, col=  ECM_clusters)) +
+  geom_point(size=0.1)+
+  geom_hline(yintercept = 0, linetype=2, size=1)+
+  geom_vline(xintercept = 0, linetype=2, size=1)+
+  coord_fixed()+
+  scale_color_manual(values = ECM_palette) +
+  theme_void() + NoLegend()
+remove(km.res, new_clusters)
+```
+
+## Figure 5.c: Spatial plot of ECM compartments
+```{r}
+ggplot(coordinates,
+       aes(x= imagecol, y=imagerow, col= ECM_clusters)) +
+  geom_point(size=0.1)+
+  coord_fixed()+
+  scale_color_manual(values = ECM_palette) +
+  theme_void() + NoLegend()
+```
+
+## Supplementary figure 5.c: Heatmap of celltype enrichments across ECM compartments
+```{r}
+ECM_clusters= c(coordinates$ECM_clusters)
+names(ECM_clusters)= coordinates$barcodes
+cosmx$ECM_clusters= ECM_clusters
+
+collagen_scaled= c(coordinates$collagen_scaled)
+names(collagen_scaled)= coordinates$barcodes
+cosmx$collagen_scaled= collagen_scaled
+
+elastin_scaled= c(coordinates$elastin_scaled)
+names(elastin_scaled)= coordinates$barcodes
+cosmx$elastin_scaled= elastin_scaled
+
+niche_assignments= cosmx@meta.data[!is.na(cosmx$ECM_clusters), c('celltypes', 'ECM_clusters')]
+
+observed=  niche_assignments %>% group_by(ECM_clusters, celltypes) %>% summarise(observed= length(celltypes) ) %>% as.data.frame()
+freq_niches= niche_assignments %>% group_by(ECM_clusters) %>% summarise(freq_niches= length(ECM_clusters) ) %>% as.data.frame()
+freq_celltypes= niche_assignments %>% group_by(celltypes) %>% summarise(freq_celltypes= length(celltypes) ) %>% as.data.frame()
+
+niche_enrichments= left_join(left_join(observed, freq_celltypes), freq_niches)
+niche_enrichments$expected= niche_enrichments$freq_celltypes * (niche_enrichments$freq_niches / nrow(niche_assignments))
+niche_enrichments$fold_change= log2(niche_enrichments$observed/niche_enrichments$expected)
+summary(niche_enrichments$fold_change)
+
+niche_enrichments$fold_change[niche_enrichments$fold_change> 1]=1
+niche_enrichments$fold_change[niche_enrichments$fold_change< -1]= -1
+
+niche_enrichments= pivot_wider(niche_enrichments[, c('ECM_clusters', 'celltypes', 'fold_change')], names_from = 'ECM_clusters',  values_from = 'fold_change' ) %>% as.data.frame()
+rownames(niche_enrichments)= niche_enrichments$celltypes
+niche_enrichments$celltypes= NULL
+
+pheatmap(niche_enrichments, display_numbers = T, number_color = 'black', angle_col = 45, cluster_cols = F, cluster_rows = T, color = divergent_palette)
+remove(ECM_clusters,  collagen_scaled, elastin_scaled, niche_assignments, observed, freq_niches, freq_celltypes, niche_enrichments, coordinates)
+```
+
+## SKIP: Transcriptomic clustering of fibroblasts
+```{r eval=FALSE, include=FALSE}
+# Subset fibroblasts from the whole dataset and select cells with at least 100 transcripts for dimensionality reduction and clustering
+fibroblasts= subset(cosmx, cells=colnames(cosmx)[cosmx$celltypes=='Fibroblasts'] ) %>% subset(nCount_Spatial >100) %>% SCTransform(assay = 'Spatial', new.assay.name = 'SCT', method='glmGamPoi')%>% RunPCA() %>% RunUMAP(dims = 1:5, reduction.name= 'umap' )  %>% FindNeighbors(dims= 1:5)  %>% FindClusters(resolution=0.15)
+
+# Rename clusters from 1 to 6
+fibroblasts$fibroblast_subclusters= fibroblasts$SCT_snn_res.0.15
+levels(fibroblasts$fibroblast_subclusters)= c('3', '1', '2', '4', '5', '6')
+fibroblasts$fibroblast_subclusters= factor(fibroblasts$fibroblast_subclusters, levels = 1:6)
+```
+
+## Figure 5.d: UMAP plot of fibroblast transcriptomic states
+```{r}
+DimPlot(fibroblasts, reduction = 'umap', group.by = 'fibroblast_subclusters', cols = fibro_palette, raster = F, pt.size = 0.5) + ggtitle('')+ coord_fixed()+ NoAxes() + NoLegend()
+```
+
+## Supplementary figure 5.d: Dotplot of fibroblast cluster expression of marker genes
+```{r}
+DefaultAssay(fibroblasts)='SCT'
+DotPlot(fibroblasts, features = c('FN1', 'COL11A1', 'ACTA2', 
+                                 'JUN', 'FOS', 'IGF1',
+                                 'LUM','MGP', 'TIMP1',
+                                 'CD74','HLA.DRB1', 'HLA.DQB1',
+                                 'CCL19',
+                                 'CXCL10'), group.by = 'fibroblast_subclusters') + NoLegend() + xlab('')+ ylab('') + RotatedAxis()
+```
+
+## Figure 5.d: Spatial plots of fibroblast transcriptomic states
+```{r fig.width= 4, fig.height=4}
+fibroblasts$section= cosmx$section
+# Plot the spatial distribution of each subcluster in section 4
+for (subcluster in as.character(1:6) ){
+  print(ggplot(fibroblasts@meta.data[fibroblasts$section== 'section_4' & fibroblasts$fibroblast_subclusters == subcluster,  ], aes(x=x_3D_px, y=y_3D_px))+ theme_void()+ geom_point(size=0.1, col= fibro_palette[subcluster])+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))+ coord_fixed())
+}
+
+# Clean environment
+remove(subcluster)
+```
+
+## Figure 5.e: Box plots of collagen and elastin content in cellular neighbourhood per fibroblast transcriptomic states
+```{r warning=FALSE}
+fibroblasts@meta.data[!is.na(fibroblasts$fibroblast_subclusters), c('fibroblast_subclusters','collagen_scaled', 'elastin_scaled')] %>%
+  pivot_longer(cols = 2:3, names_to = 'ECM_type', values_to = 'scaled_intensity') %>%
+  ggplot(aes(x= fibroblast_subclusters, y= scaled_intensity, fill= ECM_type)) +
+  geom_boxplot() +
+  geom_hline(yintercept = 0, linetype=2)+
+  scale_fill_manual(values = c(collagen_scaled='#43ff44', elastin_scaled='#f400e3')) + NoLegend() +
+  theme(axis.line = element_line(colour = "black"),
+                       text = element_text(size=10),
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_blank(),
+    panel.background = element_blank(),
+    panel.grid = element_line()) + NoLegend() + RotatedAxis()
+```
+
+## Supplementary figure 5.e: Heatmap of fibroblast cluster enrichments across ECM compartments
+```{r}
+niche_assignments= fibroblasts@meta.data[!is.na(fibroblasts$ECM_clusters), c('fibroblast_subclusters', 'ECM_clusters')]
+
+observed=  niche_assignments %>% group_by(ECM_clusters, fibroblast_subclusters) %>% summarise(observed= length(fibroblast_subclusters) ) %>% as.data.frame()
+freq_niches= niche_assignments %>% group_by(ECM_clusters) %>% summarise(freq_niches= length(ECM_clusters) ) %>% as.data.frame()
+freq_celltypes= niche_assignments %>% group_by(fibroblast_subclusters) %>% summarise(freq_celltypes= length(fibroblast_subclusters) ) %>% as.data.frame()
+
+niche_enrichments= left_join(left_join(observed, freq_celltypes), freq_niches)
+niche_enrichments$expected= niche_enrichments$freq_celltypes * (niche_enrichments$freq_niches / nrow(niche_assignments))
+niche_enrichments$fold_change= log2(niche_enrichments$observed/niche_enrichments$expected)
+
+niche_enrichments$fold_change[niche_enrichments$fold_change> 1]=1
+niche_enrichments$fold_change[niche_enrichments$fold_change< -1]= -1
+
+niche_enrichments= pivot_wider(niche_enrichments[, c('ECM_clusters', 'fibroblast_subclusters', 'fold_change')], names_from = 'ECM_clusters',  values_from = 'fold_change' ) %>% as.data.frame()
+rownames(niche_enrichments)= niche_enrichments$fibroblast_subclusters
+niche_enrichments$fibroblast_subclusters= NULL
+
+pheatmap(niche_enrichments, display_numbers = T, number_color = 'black', angle_col = 45, cluster_cols = F, cluster_rows = F,color = divergent_palette)
+remove(niche_assignments, observed, freq_niches, freq_celltypes, niche_enrichments)
+```
+
+## Supplementary figure 5.f: Heatmap of fibroblast cluster enrichments across 3D niches
+```{r}
+fibroblast_assignments= fibroblasts@meta.data[!is.na(fibroblasts$niches_3D), c('niches_3D', 'fibroblast_subclusters')]
+
+observed=  fibroblast_assignments %>% group_by(fibroblast_subclusters, niches_3D) %>% summarise(observed= length(fibroblast_subclusters) ) %>% as.data.frame()
+freq_niches= fibroblast_assignments %>% group_by(niches_3D) %>% summarise(freq_niches= length(fibroblast_subclusters) ) %>% as.data.frame()
+freq_fibroblast_subclusters= fibroblast_assignments %>% group_by(fibroblast_subclusters) %>% summarise(freq_fibroblast_subclusters= length(fibroblast_subclusters) ) %>% as.data.frame()
+
+fibroblast_enrichments= left_join(left_join(observed, freq_fibroblast_subclusters), freq_niches)
+fibroblast_enrichments$expected= fibroblast_enrichments$freq_fibroblast_subclusters * (fibroblast_enrichments$freq_niches / nrow(fibroblast_assignments))
+fibroblast_enrichments$fold_change= log2(fibroblast_enrichments$observed/fibroblast_enrichments$expected)
+summary(fibroblast_enrichments$fold_change)
+
+fibroblast_enrichments$fold_change[fibroblast_enrichments$fold_change> 1.5]=1.5
+fibroblast_enrichments$fold_change[fibroblast_enrichments$fold_change< -1.5]= -1.5
+
+fibroblast_enrichments= pivot_wider(fibroblast_enrichments[, c('fibroblast_subclusters', 'niches_3D', 'fold_change')], names_from = 'niches_3D',  values_from = 'fold_change' ) %>% as.data.frame()
+rownames(fibroblast_enrichments)= fibroblast_enrichments$fibroblast_subclusters
+fibroblast_enrichments$fibroblast_subclusters= NULL
+
+fibroblast_enrichments= fibroblast_enrichments[ , c('Tumor core', 'Tumor surface', 'Desmoplastic stroma', 'Airways', 'Alveoli', 'Vascular stroma', 'Macrophage niches', 'Dendritic cell niches', 'T cell niches','Smooth muscle')]
+pheatmap(fibroblast_enrichments, color = divergent_palette, display_numbers = F, cluster_rows = F, cluster_cols = F, angle_col = 315)
+remove(fibroblast_assignments, observed, freq_niches, freq_fibroblast_subclusters, fibroblast_enrichments)
+```
+
+## Differential gene expression of fibroblasts across ECM compartments
+```{r}
+SCT_matrix= GetAssayData(fibroblasts, assay = 'SCT')[, !is.na(fibroblasts$ECM_clusters)]
+
+fibroblasts_ECM_markers = list()
+
+for (niche in 1:3){
+  group_1_cells= fibroblasts$barcodes[fibroblasts$ECM_clusters==niche & !is.na(fibroblasts$ECM_clusters)]
+  group_2_cells= fibroblasts$barcodes[fibroblasts$ECM_clusters!=niche & !is.na(fibroblasts$ECM_clusters)]
+  ligand_markers= findmarkers(SCT_matrix,group_1_cells, group_2_cells )
+  ligand_markers$cluster=  niche
+  fibroblasts_ECM_markers[[niche]]= ligand_markers
+}
+fibroblasts_ECM_markers= bind_rows(fibroblasts_ECM_markers)
+remove(niche, group_1_cells, group_2_cells, SCT_matrix, ligand_markers)
+```
+
+## Supplementary figure 5.g: Vulcano plot of ECM compartment-specific fibroblast matrisome genes
+```{r}
+DefaultAssay(fibroblasts)='SCT'
+
+ECM_markers= matriannotate(fibroblasts_ECM_markers, gene.column = 'gene', species = "human")
+colnames(ECM_markers)[1:3]= c('gene', 'Matrisome_Division', 'Matrisome_Category')
+ECM_markers= ECM_markers[ECM_markers$pct.1>0.1, ]
+
+ECM_markers_matrisome= ECM_markers[ECM_markers$Matrisome_Division!='Non-matrisome', ]
+ECM_markers_matrisome$differential= ECM_markers_matrisome$perc_difference> 0.05 & ECM_markers_matrisome$log2FC>0.5
+table(ECM_markers_matrisome$differential)
+
+ECM_markers_matrisome$Matrisome_Category[!ECM_markers_matrisome$differential]= NA
+
+ggplot(ECM_markers_matrisome, aes(x= perc_difference, y= log2FC, col=differential))+
+  geom_point()+
+  ggrepel::geom_text_repel(ECM_markers_matrisome[ECM_markers_matrisome$perc_difference> 0.05 & ECM_markers_matrisome$log2FC>0.5, ], mapping=aes(x= perc_difference, y= log2FC, label=  gene), col= 'black', min.segment.length = 0, max.overlaps = 50, size= 2) +
+  facet_wrap('cluster', nrow = 1) + NoLegend()+
+  theme(panel.grid.major = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"), panel.border = element_blank())+
+  geom_vline(xintercept = 0.05, linetype= 2) + 
+  geom_hline(yintercept = 0.5, linetype= 2) + scale_color_manual(values=c('TRUE'= "red", 'FALSE'='grey' ))
+remove(fibroblasts_ECM_markers, ECM_markers,ECM_markers_matrisome)
+```
+
+
+# Figure 6 and Supplementary figure 6
+
+## SKIP: Tumor pseudotime analysis
+```{r eval=FALSE, include=FALSE}
+# Subsetting the surat object to include only cells annotated as 'Tumor' and generate tumor-specific embeddings
+DefaultAssay(cosmx) = 'SCT'
+tumor = subset(cosmx, cells= cosmx$barcodes[cosmx$celltypes=='Tumor cells'] ) %>%
+  SCTransform( assay = 'Spatial', new.assay.name = 'SCT', do.correct.umi = T, do.center = T, 
+               do.scale = T, verbose= T, variable.features.n = 400) %>% 
+  RunPCA() %>% RunUMAP(dims = 1:5)
+
+# Convert Seurat to SingleCellExperiment object for running pseudotime analysis with slingshot
+tumor_slingshot= SingleCellExperiment(
+  list(counts= as.matrix(tumor@assays$SCT@data ) ),
+  reducedDims = list(pca= tumor@reductions$pca@cell.embeddings[, 1:5]),
+  colData= tumor@meta.data) 
+
+# Compute pseudotime
+tumor_slingshot= slingshot(tumor_slingshot,reducedDim = 'pca')
+
+# Add pseudotime to the seurat object and convert to pseudotime rank
+tumor$tumor_pseudotime= data.frame(pathStats(tumor_slingshot$slingshot)$pseudotime)
+tumor$tumor_pseudotime_rank= rank(tumor$tumor_pseudotime, na.last = 'keep')
+tumor$tumor_pseudotime_rank= tumor$tumor_pseudotime_rank/max(tumor$tumor_pseudotime_rank, na.rm = T)
+tumor$tumor_pseudotime= NULL
+remove(tumor_slingshot)
+```
+
+## Supplementary figure 6.a: Stacked barplot of tumor cells' 3D niche assignments
+```{r warning=FALSE}
+# Proportions of tumor cells assigned to each niche
+round(prop.table(table(tumor$niches_3D))*100, digits = 1)
+
+# Set niche order before plotting
+tumor$niches_3D= factor(tumor$niches_3D, levels = c('Tumor core','Tumor surface','Airways', 'Alveoli', 'Desmoplastic stroma', 'Vascular stroma','Smooth muscle', 'Macrophage niches', 'T cell niches'  ))
+
+# Barplot of tumor cell assignments to tumor core and surface
+tumor$core_surface= tumor$niches_3D
+tumor$core_surface[!tumor$core_surface %in% c('Tumor core', 'Tumor surface')]= 'Infiltrating'
+
+p1= ggplot(tumor@meta.data, aes(x='Tumor bed', fill= core_surface))+ geom_bar(position='fill')+
+  scale_fill_manual(values = niche_palette)+
+  theme(panel.grid.major = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"), panel.border = element_blank()) +
+  xlab('') + ylab("")+ NoLegend()
+
+# Barplot of infiltrating tumor cell assignment to each niche
+tumor$infiltrating= as.character(tumor$niches_3D)
+tumor$infiltrating[tumor$core_surface %in% c('Tumor core', 'Tumor surface')]= NA
+round(prop.table(table(tumor$infiltrating))*100, digits = 1)
+
+p2= ggplot(tumor@meta.data[!is.na(tumor$infiltrating), ], aes(x='Infiltrating', fill= infiltrating))+ geom_bar(position='fill')+
+  scale_fill_manual(values = niche_palette)+
+  theme(panel.grid.major = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"), panel.border = element_blank()) +
+  xlab('') + ylab("")+ NoLegend()
+
+p1+p2
+remove(p1, p2)
+```
+
+## Fig 6.b: UMAP plot of tumor pseudotime rank and EMT marker genes
+```{r fig.width= 16, fig.height=8, warning=FALSE} 
+DefaultAssay(tumor)= 'SCT'
+FeaturePlot(tumor, c('tumor_pseudotime_rank'),  reduction = 'umap') + scale_color_gradientn(colours =  c('lightblue', 'lightgrey','red')) + NoAxes() + ggtitle('') + coord_fixed() +  scale_x_reverse() | FeaturePlot(tumor, c('CDH1', 'ITGB6', 'EPCAM',  'COL3A1'),  reduction = 'umap', min.cutoff = 0,max.cutoff = 1.5, cols= c('lightgrey', "black"), ncol = 2 )* NoAxes() * coord_fixed() * scale_x_reverse()
+```
+
+## Supplementary figure 6.b: Vulcano plot of tumor cell differential gene in early vs late pseudotime
+```{r}
+DefaultAssay(cosmx)= 'SCT'
+SCT_matrix= GetAssayData(cosmx)[, cosmx$celltypes == 'Tumor cells']
+group_1_cells= tumor$barcodes[tumor$tumor_pseudotime_rank > 0.5]
+group_2_cells= tumor$barcodes[tumor$tumor_pseudotime_rank <= 0.5]
+desmo_markers= findmarkers(SCT_matrix,group_1_cells, group_2_cells )
+
+ggplot(desmo_markers, aes(x= perc_difference, y= log2FC, col= abs(perc_difference) > 0.1))+
+  geom_point()+
+  ggrepel::geom_text_repel(desmo_markers[abs(desmo_markers$perc_difference) > 0.1 & desmo_markers$log2FC>1, ], 
+                           mapping=aes(x= perc_difference, y= log2FC, label=  gene), col= 'black', min.segment.length = 0, max.overlaps = 50, size= 2) +
+  NoLegend()+
+  theme(panel.grid.major = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"), panel.border = element_blank()) +
+  scale_color_manual(values=c('TRUE'= "red", 'FALSE'='grey' ))+
+  geom_vline(xintercept = c(0.1, -0.1), linetype= 2) + 
+  geom_hline(yintercept = 1, linetype= 2)
+
+remove(SCT_matrix, group_1_cells, group_2_cells, desmo_markers, findmarkers)
+```
+
+## Fig 6.c: Boxplot of tumor pseudotime scores across tumor core, surface and desmoplastic stroma  
+```{r}
+# Define comparisons for statistical analysis
+my_comparisons <- list( c("Tumor core", "Tumor surface"), c("Tumor surface", 'Desmoplastic stroma'), c("Tumor core", 'Desmoplastic stroma')  )
+
+ggplot(tumor@meta.data[tumor$niches_3D %in% c('Tumor core', 'Tumor surface', 'Desmoplastic stroma'), ], aes(x= niches_3D, y=tumor_pseudotime_rank, fill= niches_3D))+ 
+  geom_boxplot() +
+  ggpubr::stat_compare_means(comparisons = my_comparisons, method = 't.test' ) +
+  scale_fill_manual(values= niche_palette)+
+  NoLegend()+
+  theme(panel.grid.major = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"), panel.border = element_blank()) +
+  geom_hline(yintercept = 0.5, linetype=2)
+remove(my_comparisons)
+```
+
+## Supplementary figure 6.c: Boxplot of tumor pseudotime scores across tumor core, surface, EMT niche and desmoplastic stroma 
+```{r}
+tumor$infiltration_niches= as.character(tumor$niches_3D)
+tumor$infiltration_niches[tumor$in_EMT_niche] = 'EMT_niche'
+niche_palette['EMT_niche']='black'
+
+tumor$infiltration_niches= factor(tumor$infiltration_niches, levels= c('Tumor core', 'Tumor surface' ,'EMT_niche', 'Desmoplastic stroma'))
+
+ggplot(tumor@meta.data[!is.na(tumor$infiltration_niches) ,], aes(x= infiltration_niches, y= tumor_pseudotime_rank, col= infiltration_niches))+geom_boxplot()+scale_color_manual(values = niche_palette)+ theme_bw()  + NoLegend() + geom_hline(yintercept = 0.5, linetype=2)
+```
+
+## Supplementary figure 6.d: Spatial density of tumor cells with late pseudotime
+```{r warning=FALSE}
+ggplot(tumor@meta.data, aes(x=x_3D_px, y=y_3D_px, col=tumor_pseudotime_rank ))+
+  geom_point(size=0.01)+
+  geom_density_2d_filled(data = tumor@meta.data[tumor$tumor_pseudotime_rank>0.7,], mapping = aes(x=x_3D_px, y=y_3D_px ), alpha = 0.5, h= 5.6 * 700)+ 
+  scale_color_gradientn(colours =  c('lightblue', 'white','red')) +
+  theme_void()+
+  coord_fixed() +
+  geom_hline(yintercept = 5000)+ geom_hline(yintercept = 11000)+
+  geom_vline(xintercept = 9500)+ geom_vline(xintercept = 15500) 
+```
+
+## Fig 6.d: Spatial plot of tumor pseudotime
+```{r}
+ggplot(tumor@meta.data,
+       aes(x=x_3D_px, y=y_3D_px, col=tumor_pseudotime_rank ))+
+  geom_point(size=0.01)+
+  geom_hline(yintercept = 5000)+ geom_hline(yintercept = 11000)+
+  geom_vline(xintercept = 9500)+ geom_vline(xintercept = 15500)+
+  scale_color_gradientn(colours =  c('lightblue', 'white','red')) +
+  theme_void()+
+  coord_fixed()+
+  NoLegend()
+```
+
+## Identification of the EMT niche
+```{r}
+cosmx$in_EMT_niche= (cosmx$x_3D_px > 9500) & (cosmx$x_3D_px < 15500) & (cosmx$y_3D_px > 5000) & (cosmx$y_3D_px < 11000)
+round(prop.table(table(cosmx$celltypes[cosmx$in_EMT_niche] ))*100, digits = 1)
+```
+
+## Fig 6.e: Spatial plot of collagen content in tumor neighborhuoods
+```{r}
+tumor$section =cosmx$section
+ggplot(tumor@meta.data[tumor$section=='section_4',], aes(x= x_3D_px, y=y_3D_px, color= collagen_scaled ))+
+  geom_point(size=0.01)+
+  theme_void() +
+  coord_fixed()+
+  scale_color_gradient(low = 'lightgrey', high = '#43ff44') + NoLegend()
+```
+
+## Fig 6.f: Boxplot of collagen content in tumor neighbourhoods across tumor core, surface, EMT niche and desmoplastic stroma
+```{r}
+tumor$ECM_compartments = tumor$ECM_clusters
+tumor$ECM_compartments[tumor$in_EMT_niche] = 'EMT_niche'
+
+ECM_palette['EMT_niche']='black'
+tumor$ECM_compartments= factor(tumor$ECM_compartments, levels= c('EMT_niche', 2, 1, 3))
+ggplot(tumor@meta.data[!is.na(tumor$ECM_clusters),], aes(x= ECM_compartments , y= collagen_scaled, col= ECM_compartments))+geom_boxplot()+scale_color_manual(values = ECM_palette) + theme_bw() + NoLegend() + geom_hline(yintercept = 0, linetype=2)
+```
+
+# Figure 7 and Supplementary figure 7
+
+## Fig 7.a: Vulcano plot of differentially expressed genes by tumors cells in the EMT niche
+```{r}
+Idents(cosmx)= 'celltypes'
+DefaultAssay(cosmx)='SCT'
+EMT_niche_tumor_DGE= FindMarkers(cosmx, ident.1 = TRUE, ident.2 = FALSE, logfc.threshold = 0, subset.ident = 'Tumor cells', group.by = 'in_EMT_niche')
+
+EMT_niche_tumor_DGE$gene= rownames(EMT_niche_tumor_DGE)
+
+# Compute absolute fold changes
+EMT_niche_tumor_DGE$FC= abs(EMT_niche_tumor_DGE$avg_log2FC)
+
+# Compute percentage difference
+EMT_niche_tumor_DGE$perc_difference= EMT_niche_tumor_DGE$pct.1- EMT_niche_tumor_DGE$pct.2
+
+# Scatter plot of fold changes and percentage of expressing cells
+ggplot(EMT_niche_tumor_DGE, aes(x= perc_difference, y= FC, col= abs(perc_difference)>0.15 )) + 
+  geom_point()+
+  scale_color_manual(values= c('FALSE'= 'grey', 'TRUE'='red'))+
+  ggrepel::geom_text_repel(EMT_niche_tumor_DGE[EMT_niche_tumor_DGE$FC>0.5 & abs(EMT_niche_tumor_DGE$perc_difference)>0.15, ], mapping=aes(x= perc_difference, y= FC, label=  gene), col= 'black', min.segment.length = 0, max.overlaps = 20) +
+  theme(panel.grid.major = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"), panel.border = element_blank())+
+  #coord_fixed()+
+  NoLegend()+ 
+  geom_hline(yintercept = 0.5, linetype= 2) +
+  geom_vline(xintercept = 0.15, linetype= 2) +
+  geom_vline(xintercept = -0.15, linetype= 2) +
+  xlim(c(-0.41, 0.41))
+
+remove(EMT_niche_tumor_DGE)
+```
+
+## Supplementary figure 7.b: Celltype enrichments in the EMT niche
+```{r}
+EMTfocus_assignments= cosmx@meta.data[!is.na(cosmx$in_EMT_niche), c('celltypes', 'in_EMT_niche')]
+
+observed=  EMTfocus_assignments %>% group_by(celltypes, in_EMT_niche) %>% summarise(observed= length(celltypes) ) %>% as.data.frame()
+freq_EMTfocus= EMTfocus_assignments %>% group_by(in_EMT_niche) %>% summarise(freq_EMTfocus= length(celltypes) ) %>% as.data.frame()
+freq_celltypes= EMTfocus_assignments %>% group_by(celltypes) %>% summarise(freq_celltypes= length(celltypes) ) %>% as.data.frame()
+
+EMTfocus_enrichments= left_join(left_join(observed, freq_celltypes), freq_EMTfocus)
+EMTfocus_enrichments$expected= EMTfocus_enrichments$freq_celltypes * (EMTfocus_enrichments$freq_EMTfocus / nrow(EMTfocus_assignments))
+EMTfocus_enrichments$fold_change= log2(EMTfocus_enrichments$observed/EMTfocus_enrichments$expected)
+
+EMTfocus_enrichments$shape= 'circle'
+EMTfocus_enrichments$shape[EMTfocus_enrichments$fold_change < -1]= 'triangle'
+
+EMTfocus_enrichments$fold_change[EMTfocus_enrichments$fold_change < -1]= -1
+EMTfocus_enrichments$fold_change[EMTfocus_enrichments$in_EMT_niche==F]= 0
+
+EMTfocus_enrichments= EMTfocus_enrichments[order(EMTfocus_enrichments$fold_change, decreasing = T), ]
+EMTfocus_enrichments$celltypes= factor(EMTfocus_enrichments$celltypes, levels = rev(EMTfocus_enrichments$celltypes[EMTfocus_enrichments$in_EMT_niche]))
+
+ggplot(data = EMTfocus_enrichments[EMTfocus_enrichments$in_EMT_niche==T,], aes(x=fold_change, y=celltypes, shape=shape, col= celltypes)) + geom_point(size=4) + geom_vline(xintercept = 0)+
+  geom_line(data = EMTfocus_enrichments, mapping = aes(x=fold_change, y=celltypes, group= celltypes, col= celltypes)) + 
+  scale_color_manual(values = celltype_palette) +
+  NoLegend() + xlab('') + ylab('')+
+  theme(panel.grid.major = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"), panel.border = element_blank()) 
+remove(EMTfocus_assignments, observed, freq_EMTfocus, freq_celltypes, EMTfocus_enrichments)
+```
+
+## Supplementary figure 7.c: Stacked barplot of celltypes in the EMT niche
+```{r}
+EMT_barplot= cosmx@meta.data[, c('celltypes', 'in_EMT_niche')]
+EMT_barplot$celltypes = as.character(EMT_barplot$celltypes)
+EMT_barplot$celltypes[!EMT_barplot$celltypes %in% c('Tumor cells', 'Fibroblasts', 'Macrophages', 'Cytotoxic T cells', 'Respiratory epithelium', 'Vascular endothelium') ] = 'Others'
+
+palette= celltype_palette
+palette['Others']= 'lightgrey'
+
+EMT_barplot$celltypes= factor(EMT_barplot$celltypes, levels = c('Tumor cells', 'Fibroblasts', 'Macrophages', 'Cytotoxic T cells', 'Respiratory epithelium', 'Vascular endothelium', 'Others')  )
+EMT_barplot$in_EMT_niche= factor(EMT_barplot$in_EMT_niche, levels = c('TRUE', 'FALSE')  )
+
+EMT_barplot %>% 
+  ggplot(aes(x= in_EMT_niche, fill= celltypes)) + geom_bar(position = 'fill') +
+  scale_fill_manual(values = palette) +
+  xlab('') + ylab('') +
+  theme(panel.grid.major = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"), panel.border = element_blank()) +
+  coord_fixed()
+remove(EMT_barplot, palette)
+```
+
+## Supplementary figure 7.d: Fibroblast cluster enrichments in the EMT niche
+```{r}
+fibroblasts$in_EMT_niche= cosmx$in_EMT_niche
+EMTfocus_assignments= fibroblasts@meta.data[, c('fibroblast_subclusters', 'in_EMT_niche')]
+
+observed=  EMTfocus_assignments %>% group_by(fibroblast_subclusters, in_EMT_niche) %>% summarise(observed= length(fibroblast_subclusters) ) %>% as.data.frame()
+freq_EMTfocus= EMTfocus_assignments %>% group_by(in_EMT_niche) %>% summarise(freq_EMTfocus= length(fibroblast_subclusters) ) %>% as.data.frame()
+freq_celltypes= EMTfocus_assignments %>% group_by(fibroblast_subclusters) %>% summarise(freq_celltypes= length(fibroblast_subclusters) ) %>% as.data.frame()
+
+EMTfocus_enrichments= left_join(left_join(observed, freq_celltypes), freq_EMTfocus)
+EMTfocus_enrichments$expected= EMTfocus_enrichments$freq_celltypes * (EMTfocus_enrichments$freq_EMTfocus / nrow(EMTfocus_assignments))
+EMTfocus_enrichments$fold_change= log2(EMTfocus_enrichments$observed/EMTfocus_enrichments$expected)
+
+EMTfocus_enrichments$shape= 'circle'
+EMTfocus_enrichments$shape[EMTfocus_enrichments$fold_change < -1]= 'triangle'
+EMTfocus_enrichments$fold_change[EMTfocus_enrichments$fold_change < -1]= -1
+EMTfocus_enrichments$fold_change[EMTfocus_enrichments$in_EMT_niche==F]= 0
+
+EMTfocus_enrichments= EMTfocus_enrichments[order(EMTfocus_enrichments$fold_change, decreasing = T), ]
+
+EMTfocus_enrichments$fibroblast_subclusters= factor(EMTfocus_enrichments$fibroblast_subclusters, levels=rev(c(1, 4, 6, 2, 3, 5)))
+
+ggplot(data = EMTfocus_enrichments[EMTfocus_enrichments$in_EMT_niche==T,], aes(x=fold_change, y=fibroblast_subclusters, shape=shape, col= fibroblast_subclusters)) + geom_point(size=4) + geom_vline(xintercept = 0)+
+  geom_line(data = EMTfocus_enrichments, mapping = aes(x=fold_change, y=fibroblast_subclusters, group= fibroblast_subclusters, col= fibroblast_subclusters)) + 
+  NoLegend() + xlab('') + ylab('')+
+  theme(panel.grid.major = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"), panel.border = element_blank()) 
+remove(EMTfocus_assignments, observed, freq_EMTfocus, freq_celltypes, EMTfocus_enrichments)
+```
+
+## Figure 7.d: Spatial density of myofibroblasts
+```{r}
+ggplot(fibroblasts@meta.data[fibroblasts$fibroblast_subclusters == '1',],
+       aes(x=x_3D_px, y=y_3D_px ))+
+  geom_point(size=0.01, col= '#985D98')+
+  geom_density_2d_filled(alpha = 0.5, h= 5.6 * 700)+ 
+  geom_hline(yintercept = 5000)+ geom_hline(yintercept = 11000)+
+  geom_vline(xintercept = 9500)+ geom_vline(xintercept = 15500)+
+  theme_void()+
+  coord_fixed()+
+  NoLegend()
+```
+
+## Supplementary figure 7.e: Vulcano plot of differentially expressed genes by macrophages in the EMT niche
+```{r}
+Idents(cosmx)= 'celltypes'
+DefaultAssay(cosmx)='SCT'
+EMT_niche_macro_DGE= FindMarkers(cosmx, ident.1 = TRUE, ident.2 = FALSE, logfc.threshold = 0, subset.ident = 'Macrophages', group.by = 'in_EMT_niche')
+
+EMT_niche_macro_DGE$gene= rownames(EMT_niche_macro_DGE)
+
+# Compute absolute fold changes
+EMT_niche_macro_DGE$FC= abs(EMT_niche_macro_DGE$avg_log2FC)
+
+# Compute percentage difference
+EMT_niche_macro_DGE$perc_difference= EMT_niche_macro_DGE$pct.1- EMT_niche_macro_DGE$pct.2
+
+# Scatter plot of fold changes and percentage of expressing cells
+ggplot(EMT_niche_macro_DGE, aes(x= perc_difference, y= FC, col= abs(perc_difference)>0.15 )) + 
+  geom_point()+
+  scale_color_manual(values= c('FALSE'= 'grey', 'TRUE'='red'))+
+  ggrepel::geom_text_repel(EMT_niche_macro_DGE[EMT_niche_macro_DGE$FC>0.5 & abs(EMT_niche_macro_DGE$perc_difference)>0.15, ], mapping=aes(x= perc_difference, y= FC, label=  gene), col= 'black', min.segment.length = 0, max.overlaps = 20) +
+  theme(panel.grid.major = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"), panel.border = element_blank())+
+  #coord_fixed()+
+  NoLegend()+ 
+  geom_hline(yintercept = 0.5, linetype= 2) +
+  geom_vline(xintercept = 0.15, linetype= 2) +
+  geom_vline(xintercept = -0.15, linetype= 2) 
+
+remove(EMT_niche_macro_DGE)
+```
+
+## Supplementary figure 7.f: Vulcano plot of differentially expressed genes by fibroblasts in the EMT niche
+```{r}
+Idents(cosmx)= 'celltypes'
+DefaultAssay(cosmx)='SCT'
+EMT_niche_fibro_DGE= FindMarkers(cosmx, ident.1 = TRUE, ident.2 = FALSE, logfc.threshold = 0, subset.ident = 'Fibroblasts', group.by = 'in_EMT_niche')
+
+EMT_niche_fibro_DGE$gene= rownames(EMT_niche_fibro_DGE)
+
+# Compute absolute fold changes
+EMT_niche_fibro_DGE$FC= abs(EMT_niche_fibro_DGE$avg_log2FC)
+
+# Compute percentage difference
+EMT_niche_fibro_DGE$perc_difference= EMT_niche_fibro_DGE$pct.1- EMT_niche_fibro_DGE$pct.2
+
+# Scatter plot of fold changes and percentage of expressing cells
+ggplot(EMT_niche_fibro_DGE, aes(x= perc_difference, y= FC, col= abs(perc_difference)>0.15 )) + 
+  geom_point()+
+  scale_color_manual(values= c('FALSE'= 'grey', 'TRUE'='red'))+
+  ggrepel::geom_text_repel(EMT_niche_fibro_DGE[EMT_niche_fibro_DGE$FC>0.5 & abs(EMT_niche_fibro_DGE$perc_difference)>0.15, ], mapping=aes(x= perc_difference, y= FC, label=  gene), col= 'black', min.segment.length = 0, max.overlaps = 20) +
+  theme(panel.grid.major = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"), panel.border = element_blank())+
+  #coord_fixed()+
+  NoLegend()+ 
+  geom_hline(yintercept = 0.5, linetype= 2) +
+  geom_vline(xintercept = 0.15, linetype= 2) +
+  geom_vline(xintercept = -0.15, linetype= 2) +
+  xlim(c(-0.41, 0.41))
+remove(EMT_niche_fibro_DGE)
+```
+
+## Supplementary figure 7.g: Vulcano plot of receptor-ligand interactions in the EMT niche
+```{r}
+interaction_matrix= GetAssayData(cosmx, assay = 'interaction_from_matrix')[, cosmx$celltypes=='Tumor cells' & !is.na(cosmx$niches_3D) ]
+group_1_cells= cosmx$barcodes[cosmx$celltypes=='Tumor cells' & cosmx$in_EMT_niche & !is.na(cosmx$niches_3D)]
+group_1_avg= rowMeans(interaction_matrix[, group_1_cells])
+pct.1= rowMeans(interaction_matrix[, group_1_cells]>0)
+
+group_2_cells= cosmx$barcodes[cosmx$celltypes=='Tumor cells' & !cosmx$in_EMT_niche & !is.na(cosmx$niches_3D)]
+group_2_avg= rowMeans(interaction_matrix[, group_2_cells])
+pct.2= rowMeans(interaction_matrix[, group_2_cells]>0)
+
+avg_log2FC= log2(group_1_avg/ group_2_avg)
+
+interaction_markers= data.frame(avg_log2FC, pct.1, pct.2, gene= rownames(interaction_matrix) )
+
+interaction_markers$log2FC= abs(interaction_markers$avg_log2FC)
+interaction_markers$perc_difference= interaction_markers$pct.1- interaction_markers$pct.2
+
+ggplot(interaction_markers, aes(x= perc_difference, y= log2FC, col= abs(perc_difference)>0.05 )) + 
+  geom_point()+
+  scale_color_manual(values= c('FALSE'= 'grey', 'TRUE'='red'))+
+  ggrepel::geom_text_repel(interaction_markers[interaction_markers$log2FC>0.5 & abs(interaction_markers$perc_difference)>0.05, ], mapping=aes(x= perc_difference, y= log2FC, label=  gene), col= 'black', min.segment.length = 0, max.overlaps = 20, size=2) +
+  theme(panel.grid.major = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"), panel.border = element_blank())+
+  #coord_fixed()+
+  NoLegend()+ 
+  geom_hline(yintercept = 0.5, linetype= 2) +
+  geom_vline(xintercept = 0.05, linetype= 2) +
+  geom_vline(xintercept = -0.05, linetype= 2)
+remove(integrin_interactions, interaction_matrix, group_1_cells, group_1_avg, pct.1, group_2_cells, group_2_avg, pct.2, avg_log2FC)
+```
+
+## Figure 7.h: Dotplot of senders and receivers of EMT niche-specific receptor-ligand interactions
+```{r fig.height=4, fig.width=8, warning=TRUE}
+EMT_interactions = interaction_markers$gene[interaction_markers$log2FC>0.5 & interaction_markers$perc_difference>0.05]
+EMT_niche= subset(cosmx, subset= in_EMT_niche==TRUE)
+Idents(EMT_niche)= 'celltypes'
+
+a <- DotPlot(EMT_niche, features =EMT_interactions, assay = 'interaction_from_matrix',  idents = c('Tumor cells', 'Fibroblasts', 'Macrophages'), scale = T)+ RotatedAxis()
+a$data$assay= 'ab_R'
+
+b <- DotPlot( EMT_niche, features = EMT_interactions, assay = 'interaction_to_matrix', idents = c('Tumor cells', 'Fibroblasts', 'Macrophages'), scale = T) + RotatedAxis()
+b$data$assay= 'aa_S' 
+
+dotplot_data= rbind(a$data[, c('pct.exp', 'id', 'avg.exp.scaled', 'assay', 'features.plot')],
+                    b$data[, c('pct.exp', 'id', 'avg.exp.scaled', 'assay', 'features.plot')])
+dotplot_data$id= factor(dotplot_data$id , levels=  c('Tumor cells', 'Fibroblasts', 'Macrophages'))
+dotplot_data$features.plot= factor(dotplot_data$features.plot , levels= EMT_interactions[c(9, 6, 2, 3, 4, 5, 8, 10, 1, 7)] )
+dotplot_data= dotplot_data[dotplot_data$pct.exp >10, ]
+
+ggplot()+
+  geom_point(data= dotplot_data[dotplot_data$assay == 'ab_R', ], mapping= aes(x=assay, y=id, col=avg.exp.scaled, size=pct.exp))+
+  scale_color_gradient(low='lightgrey', high='blue', limits=c(-0.5, 1), na.value = 'blue') +
+  ggnewscale::new_scale_color() +
+  geom_point(data= dotplot_data[dotplot_data$assay == 'aa_S', ], mapping= aes(x=assay, y=id, col=avg.exp.scaled, size=pct.exp))+
+  scale_color_gradient(low='lightgrey', high='orange', limits=c(-0.5, 1), na.value = 'orange') +
+  theme(panel.grid.major = element_blank(), panel.background = element_blank(), axis.line = element_line(colour = "black"), panel.border = element_blank()) +
+  facet_wrap('features.plot', nrow = 1) +
+  xlab('') + ylab('')
+remove(EMT_interactions, interaction_markers, EMT_niche, a, b, dotplot_data)
+```
+

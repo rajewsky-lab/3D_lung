@@ -1,9 +1,9 @@
 # 3D_lung
 Code avaliability for the 'Combining spatial transcriptomics and ECM imaging in 3D for mapping cellular interactions the tumor microenvironment' paper.
 
-Recommended: Please refer to the R notebook '' to reproduce the paper analyses and figures starting from the 'preprocessed_objects' downloaded from Zenodo.
+Recommended: Please refer to the R notebook 'code_avaliability' to reproduce the paper analyses and figures starting from the 'preprocessed_objects' downloaded from Zenodo. Alternatively, please access the notebook file directly from Zenodo to visualize the notebook outputs in line with the code.
 
-Optional: The '' python script and the 'cosmx_flat_files' (heavy), 'SHG' and 'stimwrap_files' are shared for full reproducibility.
+The 'compute_neighborhoods_matrices.py' and 'STIM_alignment.sh' python scripts and the 'cosmx_flat_files' (heavy), 'SHG' and 'stimwrap_files' are shared for full reproducibility.
 
 3D data can also be interactively explored at https://lung-3d-browser.mdc-berlin.de. In the browser one can:
 1. Visualise and interact with the 3D volumetric rendering of multicellular niches. To hide them, click in the dots of all the ‘Mesh’ items in the ‘Pipeline’ menu top left and leave only ‘PC_Model’ unchecked to visualise the single cells
